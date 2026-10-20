@@ -29,7 +29,17 @@ socket copy is still live. No DRM, input device, monitor, seat or VT is needed.
 
 For local daemon testing on a headless host, the hidden `--test-seat seat1`
 option creates a non-VT socket independently of udev. It never grants device
-access outside the real central `seat_udev` authority.
+access outside the real central `seat_udev` authority. The committed root
+end-to-end harness uses that path with a private D-Bus daemon, `seat-launch`,
+and a temporary build of the patched libseat fork:
+
+```sh
+./tests/root-e2e.sh
+```
+
+It requires passwordless `sudo`, Meson/Ninja, and the sibling libseat checkout
+(override with `LIBSEAT_REPO=/path/to/libseat`); missing prerequisites return
+status 77.
 
 ## Runtime
 
