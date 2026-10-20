@@ -142,7 +142,22 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .object_server()
         .at(OBJECT_PATH, Manager::new(registry.clone()))
         .await?;
-    connection.request_name(BUS_NAME).await?;
+    // Not zbus's default flags (ALLOW_REPLACEMENT | REPLACE_EXISTING |
+    // DO_NOT_QUEUE): a second instance must not be able to take the name
+    // away from the daemon that owns the seat sockets.
+    match connection
+        .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
+        .await
+    {
+        Ok(_) => {}
+        Err(zbus::Error::NameTaken) => {
+            return Err(format!(
+                "{BUS_NAME} is already owned on this bus; another multiseatd is running"
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    }
     let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
 
     let initial_seats = context.borrow().seats();
@@ -163,6 +178,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            // Without the bus we can no longer publish seats, so die and
+            // let the supervisor restart us with a fresh connection.
+            _ = connection.closed() => return Err("lost the D-Bus connection".into()),
             _ = release.recv() => {
                 broker.borrow_mut().vt_release(&seat0);
                 acknowledge_vt(true);
