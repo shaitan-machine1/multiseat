@@ -1,0 +1,12 @@
+[package]
+name = "seat-launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+nix.workspace = true
+seat-udev.workspace = true

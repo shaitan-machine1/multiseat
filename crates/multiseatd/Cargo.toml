@@ -1,0 +1,19 @@
+[package]
+name = "multiseatd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+nix.workspace = true
+rustix.workspace = true
+seat-udev.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zbus.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
