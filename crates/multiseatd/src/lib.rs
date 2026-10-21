@@ -1,7 +1,5 @@
-pub mod authority;
-pub mod broker;
-pub mod connection;
+pub mod config;
 pub mod dbus;
-pub mod device;
-pub mod protocol;
-pub mod vt;
+pub mod orchestrator;
+pub mod service;
+pub mod topology;

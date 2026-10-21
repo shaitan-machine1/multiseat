@@ -1,0 +1,5 @@
+#!/bin/sh
+exec 2>&1
+umask 077
+install -d -m 0700 /run/multiseatd /run/multiseatd/scandir /run/multiseatd/services
+exec /usr/bin/s6-svscan /run/multiseatd/scandir

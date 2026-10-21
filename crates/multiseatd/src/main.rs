@@ -1,21 +1,12 @@
 use clap::{Parser, ValueEnum};
-use multiseatd::authority::ContextAuthority;
-use multiseatd::broker::Broker;
-use multiseatd::connection;
 use multiseatd::dbus::{BUS_NAME, Manager, OBJECT_PATH, SeatRegistry};
-use multiseatd::device::RealDeviceOps;
-use multiseatd::vt::{LinuxVtOps, VtOps, current_vt};
-use seat_udev::{Context, Event, SeatName};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::Duration;
-use tokio::net::UnixListener;
-use tokio::task::JoinHandle;
-use zbus::object_server::SignalEmitter;
+use multiseatd::orchestrator::Orchestrator;
+use multiseatd::service::S6SeatServiceManager;
+use multiseatd::topology::UdevTopology;
+use seat_udev::SeatName;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BusKind {
@@ -24,137 +15,73 @@ enum BusKind {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Central udev-aware seatd-compatible broker")]
+#[command(
+    version,
+    about = "Orchestrate one s6-supervised seatd process per udev seat"
+)]
 struct Args {
     #[arg(long, default_value = "/run/multiseatd")]
     runtime_dir: PathBuf,
+    #[arg(long, default_value = "/usr/bin/seatd")]
+    seatd_program: PathBuf,
+    #[arg(long, default_value_t = 10_000)]
+    readiness_timeout_ms: u64,
     #[arg(long, value_enum, default_value_t = BusKind::System)]
     bus: BusKind,
-    /// Add a non-VT seat independently of udev (local protocol testing only).
+    /// Add an empty non-VT seat independently of udev (local testing only).
     #[arg(long, hide = true)]
     test_seat: Vec<SeatName>,
 }
 
-struct Unit {
-    task: JoinHandle<()>,
-    socket: PathBuf,
-}
-
-struct Units {
-    runtime_dir: PathBuf,
-    broker: Rc<RefCell<Broker>>,
-    units: HashMap<SeatName, Unit>,
-}
-
-impl Units {
-    fn new(runtime_dir: PathBuf, broker: Rc<RefCell<Broker>>) -> Self {
-        Self {
-            runtime_dir,
-            broker,
-            units: HashMap::new(),
-        }
-    }
-
-    async fn add(&mut self, seat: SeatName, vt_bound: bool) -> std::io::Result<bool> {
-        if self.units.contains_key(&seat) {
-            return Ok(false);
-        }
-        let socket = self.runtime_dir.join(format!("{seat}.sock"));
-        let _ = fs::remove_file(&socket);
-        let listener = UnixListener::bind(&socket)?;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-        let current_vt = if vt_bound { current_vt().ok() } else { None };
-        self.broker
-            .borrow_mut()
-            .add_seat(seat.clone(), vt_bound, current_vt);
-        let broker = self.broker.clone();
-        let task_seat = seat.clone();
-        let task = tokio::task::spawn_local(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        tokio::task::spawn_local(connection::serve(
-                            stream,
-                            task_seat.clone(),
-                            broker.clone(),
-                        ));
-                    }
-                    Err(error) => {
-                        tracing::error!(seat = %task_seat, %error, "accept failed");
-                        break;
-                    }
-                }
-            }
-        });
-        self.units.insert(seat, Unit { task, socket });
-        Ok(true)
-    }
-
-    fn remove(&mut self, seat: &SeatName) -> bool {
-        let Some(unit) = self.units.remove(seat) else {
-            return false;
-        };
-        unit.task.abort();
-        self.broker.borrow_mut().remove_seat(seat);
-        let _ = fs::remove_file(unit.socket);
-        true
-    }
-}
-
-impl Drop for Units {
-    fn drop(&mut self) {
-        for (_, unit) in self.units.drain() {
-            unit.task.abort();
-            let _ = fs::remove_file(unit.socket);
-        }
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Without an explicit default, an unset RUST_LOG means "error only",
-    // which leaves a supervised daemon with an empty log and nothing to
-    // diagnose a live seat or VT failure with.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "multiseatd=info".into()),
         )
         .init();
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, run(Args::parse()))
+    runtime.block_on(run(Args::parse()))
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(&args.runtime_dir)?;
-    fs::set_permissions(&args.runtime_dir, fs::Permissions::from_mode(0o700))?;
-
-    let context = Rc::new(RefCell::new(Context::new()?));
-    let authority = Rc::new(ContextAuthority::new(context.clone()));
-    let vt_ops = Rc::new(LinuxVtOps);
-    let broker = Rc::new(RefCell::new(Broker::with_vt(
-        authority,
-        Rc::new(RealDeviceOps),
-        vt_ops.clone(),
+    let topology = UdevTopology::new(args.runtime_dir.clone(), args.test_seat);
+    let services = S6SeatServiceManager::new(
+        args.runtime_dir,
+        args.seatd_program,
+        args.readiness_timeout_ms,
+    )?;
+    let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+        Box::new(topology),
+        Box::new(services),
     )));
-    let mut units = Units::new(args.runtime_dir.clone(), broker.clone());
+
+    let registry = SeatRegistry::default();
+    {
+        let orchestrator = orchestrator.lock().await;
+        for failure in orchestrator.converge_startup()? {
+            tracing::error!(%failure, "could not converge seat during startup");
+        }
+        for seat in orchestrator.ready_seats()? {
+            tracing::info!(seat = %seat, "publishing ready seat");
+            registry.insert(&seat);
+        }
+    }
 
     let builder = match args.bus {
         BusKind::System => zbus::connection::Builder::system(),
         BusKind::Session => zbus::connection::Builder::session(),
     };
-    let registry = SeatRegistry::default();
     let connection = builder.build().await?;
     connection
         .object_server()
-        .at(OBJECT_PATH, Manager::new(registry.clone()))
+        .at(
+            OBJECT_PATH,
+            Manager::new(registry.clone(), orchestrator.clone()),
+        )
         .await?;
-    // Not zbus's default flags (ALLOW_REPLACEMENT | REPLACE_EXISTING |
-    // DO_NOT_QUEUE): a second instance must not be able to take the name
-    // away from the daemon that owns the seat sockets.
     match connection
         .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
         .await
@@ -166,89 +93,12 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        Err(e) => return Err(e.into()),
-    }
-    let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
-
-    let initial_seats = context.borrow().seats();
-    for seat in initial_seats.into_iter().chain(args.test_seat) {
-        let added = units.add(seat.clone(), seat == SeatName::seat0()).await?;
-        if added {
-            tracing::info!(seat = %seat, "serving seat");
-            registry.insert(seat.as_str());
-        }
+        Err(error) => return Err(error.into()),
     }
 
-    let seat0 = SeatName::seat0();
-    let mut release =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-    let mut acquire =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
-
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            // Without the bus we can no longer publish seats, so die and
-            // let the supervisor restart us with a fresh connection.
-            _ = connection.closed() => return Err("lost the D-Bus connection".into()),
-            // The broker answers the kernel itself, once the outgoing
-            // client has acknowledged its disable.
-            _ = release.recv() => {
-                broker.borrow_mut().vt_release(&seat0);
-            }
-            _ = acquire.recv() => {
-                if let Err(error) = vt_ops.ack_acquire() {
-                    tracing::warn!(%error, "could not acknowledge the VT acquisition");
-                }
-                match current_vt() {
-                    Ok(vt) => broker.borrow_mut().vt_acquire(&seat0, vt),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "acquired a VT but could not read which one"
-                    ),
-                }
-            }
-            _ = interval.tick() => {
-                loop {
-                    let events = context.borrow_mut().receive()?;
-                    let Some(events) = events else { break };
-                    for event in events {
-                        match event {
-                            Event::DeviceRemoved(device) => {
-                                if let Some(path) = device.devnode {
-                                    broker.borrow_mut().revoke_path(&device.seat, &path);
-                                }
-                            }
-                            Event::DeviceMoved { device, from } => {
-                                if let Some(path) = device.devnode {
-                                    broker.borrow_mut().revoke_path(&from, &path);
-                                }
-                            }
-                            Event::SeatAdded(seat) => {
-                                if units.add(seat.clone(), seat == seat0).await? {
-                                    registry.insert(seat.as_str());
-                                    Manager::seat_new(&emitter, seat.as_str()).await?;
-                                }
-                            }
-                            Event::SeatRemoved(seat) => {
-                                if units.remove(&seat) {
-                                    registry.remove(seat.as_str());
-                                    Manager::seat_removed(&emitter, seat.as_str()).await?;
-                                }
-                            }
-                            Event::DeviceAdded(_) => {}
-                        }
-                    }
-                }
-            }
-        }
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = connection.closed() => return Err("lost the D-Bus connection".into()),
     }
-    drop(units);
-    remove_dir_if_empty(&args.runtime_dir);
     Ok(())
-}
-
-fn remove_dir_if_empty(path: &Path) {
-    let _ = fs::remove_dir(path);
 }

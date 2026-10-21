@@ -1,19 +1,73 @@
 # multiseat
 
-M1's central seat broker and compositor launcher:
+Rust topology and orchestration tools for one seatd process per udev seat.
 
-- `multiseatd`: one root process, one monitor-first `seat_udev::Context`, one
-  isolated seat unit/socket per current udev seat, a seatd-compatible wire
-  server, VT handling for seat0, queued activation for non-VT seats, device
-  authorization/revocation, D-Bus seat discovery, and one optional opener
-  pidfd per client;
-- `seat-launch`: root development launcher which connects first, inherits the
-  connection as fd 3, initializes groups, drops uid/gid and executes a normal
-  libseat compositor.
+- `multiseatd` takes a fresh udev snapshot at startup and on explicit refresh,
+  compares it with immutable deployed service manifests, and controls transient
+  seatd services through s6 CLI tools.
+- `multiseatctl` lists published seats and previews/confirms disruptive refresh.
+- `seat-launch` remains a root development launcher for passing a connected
+  seat socket to an unprivileged libseat compositor.
 
-The workspace pins `seat-udev` through exact SSH tag `v0.1.0`. The paired
-libseat fork preserves API/ABI and adds `SEATD_FD` plus a Linux pidfd attached
-to the unchanged `CLIENT_OPEN_SEAT` packet.
+The workspace pins `seat-udev` through exact SSH tag `v0.1.0`. It does not
+implement the seatd wire protocol and does not monitor udev continuously.
+aclad retains its independent udev monitor.
+
+## Runtime model
+
+A fixed nested `s6-svscan` watches:
+
+```text
+/run/multiseatd/scandir/
+```
+
+multiseatd generates immutable services under:
+
+```text
+/run/multiseatd/services/<seat>-<configuration-hash>/
+```
+
+and attaches them with `s6-svlink`. Each service executes `seatd -n 3` with:
+
+```text
+SEATD_SEAT=<seat>
+SEATD_SOCK=/run/multiseatd/<seat>.sock
+SEATD_VTBOUND=0|1
+SEATD_DEVICES=<comma-separated-static-allowlist>
+```
+
+The socket is mode 0600. SDDM's root helper connects before dropping
+privileges and passes the actual descriptor number only to a supported
+seat-owning compositor through `SEATD_FD`.
+
+Deployed state comes from generated `config.json` manifests and s6 state, not
+an in-memory cache or `/proc/<pid>/environ`. Unchanged ready seats are left
+alone. A changed seat is removed, stopped, unlinked, regenerated, linked,
+awaited, and published again.
+
+## Explicit refresh
+
+Topology does not change until requested:
+
+```sh
+sudo multiseatctl list
+sudo multiseatctl refresh seat1
+sudo multiseatctl refresh --force
+```
+
+The CLI prints old/new allowlists, any sessiond sessions it can query, and a
+warning that graphical sessions may be terminated. Without `--force` it asks
+for confirmation. The D-Bus mutation also requires an explicit confirmation
+argument and independently verifies that the caller uid is root. Refreshes are
+serialized.
+
+D-Bus:
+
+- service: `org.decoupling.multiseatd1`
+- object: `/org/decoupling/multiseatd1`
+- interface: `org.decoupling.multiseatd1.Manager`
+- methods: `ListSeats`, `PreviewRefresh`, root-only `Refresh`
+- signals: `SeatNew`, `SeatRemoved`
 
 ## Build and tests
 
@@ -23,60 +77,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The tests use fake authority/device backends and real Unix socket ancillary
-fd passing. The protocol e2e proves that opener death removes a client while a
-socket copy is still live. No DRM, input device, monitor, seat or VT is needed.
-
-For local daemon testing on a headless host, the hidden `--test-seat seat1`
-option creates a non-VT socket independently of udev. It never grants device
-access outside the real central `seat_udev` authority. The committed root
-end-to-end harness uses that path with a private D-Bus daemon, `seat-launch`,
-and a temporary build of the patched libseat fork:
+Unit tests use normalized configuration and fake topology/service backends.
+The generated-service test does not need a running s6 installation. The root
+end-to-end harness additionally requires the sibling patched seatd/libseat
+checkout, D-Bus and s6 tools:
 
 ```sh
 ./tests/root-e2e.sh
 ```
 
-It requires passwordless `sudo`, Meson/Ninja, and the sibling libseat checkout
-(override with `LIBSEAT_REPO=/path/to/libseat`); missing prerequisites return
-status 77.
+Run root harnesses as the normal user; they invoke passwordless `sudo`
+internally. Missing live prerequisites return status 77.
 
-## Runtime
-
-- sockets: `/run/multiseatd/<seat>.sock`;
-- D-Bus: `org.decoupling.multiseatd1`, object
-  `/org/decoupling/multiseatd1`, interface
-  `org.decoupling.multiseatd1.Manager`;
-- methods/signals: `ListSeats`, `SeatNew`, `SeatRemoved`.
-
-Install `dist/dbus/org.decoupling.multiseatd1.conf`. The Artix s6 longrun must
-depend on the udev coldplug/settle oneshot and system D-Bus. There are no
-per-seat s6 services.
-
-```sh
-sudo seat-launch --seat seat0 --user alice -- sway
-```
-
-Live DRM/input and VT verification is deferred to the two-seat M5 VM.
-
-## Design notes
-
-- **The kernel owns the current VT, not the daemon.** A VT-bound seat
-  re-reads the foreground terminal (`VT_GETSTATE` on `/dev/tty0`) whenever a
-  client opens the seat. The daemon is only told about switches it arbitrates
-  itself, so a value cached at startup goes stale the moment a getty, `chvt`
-  or a display manager jumping to the session VT moves the foreground; the
-  seat would then be bound to a terminal nobody is on, and the real terminal
-  would keep whatever VT owner registered itself last.
-- **A VT release is acknowledged last.** When the kernel signals a switch
-  away from a seat's VT, the daemon disables the active client and answers
-  `VT_RELDISP` only once that client has acknowledged, or once the disable is
-  forced by the two-second timeout, or once the client disconnects. The
-  acknowledgement is what releases the switching process from
-  `VT_WAITACTIVE`, so answering it early lets a display manager start the
-  next compositor while the previous one still holds the seat; the new
-  compositor is then refused its devices and exits, which looks like a
-  graphics failure rather than a handover race.
-- **Logs at info by default.** An unset `RUST_LOG` means "error only" in
-  `tracing`, which leaves a supervised daemon with an empty log. Seat opens,
-  activations, VT takeovers/releases and every failed VT ioctl are logged.
+For headless test environments, hidden `--test-seat seat1` adds an empty,
+non-VT test seat to each fresh snapshot. It does not grant any device.
