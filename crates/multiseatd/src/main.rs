@@ -4,12 +4,11 @@ use multiseatd::broker::Broker;
 use multiseatd::connection;
 use multiseatd::dbus::{BUS_NAME, Manager, OBJECT_PATH, SeatRegistry};
 use multiseatd::device::RealDeviceOps;
-use multiseatd::vt::{LinuxVtOps, current_vt};
+use multiseatd::vt::{LinuxVtOps, VtOps, current_vt};
 use seat_udev::{Context, Event, SeatName};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -135,10 +134,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let context = Rc::new(RefCell::new(Context::new()?));
     let authority = Rc::new(ContextAuthority::new(context.clone()));
+    let vt_ops = Rc::new(LinuxVtOps);
     let broker = Rc::new(RefCell::new(Broker::with_vt(
         authority,
         Rc::new(RealDeviceOps),
-        Rc::new(LinuxVtOps),
+        vt_ops.clone(),
     )));
     let mut units = Units::new(args.runtime_dir.clone(), broker.clone());
 
@@ -192,12 +192,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // Without the bus we can no longer publish seats, so die and
             // let the supervisor restart us with a fresh connection.
             _ = connection.closed() => return Err("lost the D-Bus connection".into()),
+            // The broker answers the kernel itself, once the outgoing
+            // client has acknowledged its disable.
             _ = release.recv() => {
                 broker.borrow_mut().vt_release(&seat0);
-                acknowledge_vt(true);
             }
             _ = acquire.recv() => {
-                acknowledge_vt(false);
+                if let Err(error) = vt_ops.ack_acquire() {
+                    tracing::warn!(%error, "could not acknowledge the VT acquisition");
+                }
                 match current_vt() {
                     Ok(vt) => broker.borrow_mut().vt_acquire(&seat0, vt),
                     Err(error) => tracing::warn!(
@@ -244,20 +247,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(units);
     remove_dir_if_empty(&args.runtime_dir);
     Ok(())
-}
-
-fn acknowledge_vt(release: bool) {
-    let Ok(file) = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty0")
-    else {
-        return;
-    };
-    // VT_RELDISP: 1 acknowledges release, VT_ACKACQ (2) acknowledges acquire.
-    unsafe {
-        libc::ioctl(file.as_raw_fd(), 0x5605, if release { 1 } else { 2 });
-    }
 }
 
 fn remove_dir_if_empty(path: &Path) {

@@ -48,6 +48,9 @@ struct Seat {
     clients: VecDeque<ClientId>,
     active: Option<ClientId>,
     next: Option<ClientId>,
+    /// A VT switch the kernel is holding open until the outgoing client
+    /// has acknowledged its disable.
+    release_pending: bool,
 }
 
 pub struct OpenedSeat {
@@ -97,6 +100,7 @@ impl Broker {
             clients: VecDeque::new(),
             active: None,
             next: None,
+            release_pending: false,
         });
     }
 
@@ -248,6 +252,9 @@ impl Broker {
         tracing::info!(seat = %seat_name, client = id, session, "closed client");
         self.revoke_all(client);
         self.activate_next(&seat_name);
+        // A client that disconnects instead of acknowledging still has to
+        // let the switch through.
+        self.finish_vt_release(&seat_name);
         if closed_active_vt
             && self
                 .seats
@@ -335,7 +342,9 @@ impl Broker {
                 seat.active = None;
             }
         }
+        tracing::info!(client = id, seat = %seat_name, "client acknowledged the disable");
         self.activate_next(&seat_name);
+        self.finish_vt_release(&seat_name);
         Ok(())
     }
 
@@ -358,6 +367,7 @@ impl Broker {
             }
         }
         self.activate_next(&seat_name);
+        self.finish_vt_release(&seat_name);
     }
 
     pub fn switch_session(&mut self, id: ClientId, session: i32) -> Result<(), i32> {
@@ -394,21 +404,63 @@ impl Broker {
         self.disable_client(id)
     }
 
+    /// Starts the release handshake for a VT switch the kernel has signalled.
+    ///
+    /// The kernel is only answered once the outgoing client reports that it
+    /// has given up its devices, or once the disable is forced. Answering
+    /// earlier releases `VT_WAITACTIVE` in whatever asked for the switch,
+    /// which then starts the next compositor while this seat still has an
+    /// active client; that compositor is refused its devices and gives up,
+    /// which is exactly how a display manager's session dies with no
+    /// diagnosis beyond "no drm device found".
     pub fn vt_release(&mut self, name: &SeatName) {
         let active = self.seats.get(name).and_then(|seat| seat.active);
         tracing::info!(seat = %name, client = ?active, "VT release requested");
+        let mut disabled = false;
         if let Some(id) = active {
-            if let Err(error) = self.disable_client(id) {
-                tracing::warn!(
+            match self.disable_client(id) {
+                Ok(()) => disabled = true,
+                Err(error) => tracing::warn!(
                     seat = %name,
                     client = id,
                     errno = error,
                     "could not disable the active client for the VT release"
-                );
+                ),
             }
         }
         if let Some(seat) = self.seats.get_mut(name) {
             seat.current_session = None;
+            seat.release_pending = true;
+        }
+        if !disabled {
+            self.finish_vt_release(name);
+        }
+    }
+
+    /// Answers a pending VT release once no client still owes an
+    /// acknowledgement.
+    fn finish_vt_release(&mut self, name: &SeatName) {
+        let Some(seat) = self.seats.get(name) else {
+            return;
+        };
+        if !seat.release_pending {
+            return;
+        }
+        if seat.clients.iter().any(|id| {
+            self.clients
+                .get(id)
+                .is_some_and(|client| client.state == ClientState::PendingDisable)
+        }) {
+            return;
+        }
+        if let Some(seat) = self.seats.get_mut(name) {
+            seat.release_pending = false;
+        }
+        match self.vt_ops.ack_release() {
+            Ok(()) => tracing::info!(seat = %name, "acknowledged the VT release"),
+            Err(error) => {
+                tracing::warn!(seat = %name, %error, "could not acknowledge the VT release")
+            }
         }
     }
 
@@ -613,6 +665,121 @@ mod tests {
             self.calls.borrow_mut().push(format!("switch:{target}"));
             Ok(())
         }
+        fn ack_release(&self) -> io::Result<()> {
+            self.calls.borrow_mut().push("ack_release".to_string());
+            Ok(())
+        }
+        fn ack_acquire(&self) -> io::Result<()> {
+            self.calls.borrow_mut().push("ack_acquire".to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_kernel_release_is_answered_only_after_the_client_acknowledges() {
+        // The kernel holds the switching process inside VT_WAITACTIVE until
+        // the release is answered. Answering it before the outgoing client
+        // has given up its devices lets a display manager start the next
+        // compositor against a seat that is still busy.
+        let vt = Rc::new(FakeVt::default());
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = broker.allocate_client();
+        assert!(broker.open_seat(client, &seat, tx).unwrap().active);
+
+        broker.vt_release(&seat);
+        assert_eq!(vt.calls.borrow().as_slice(), ["open:7"]);
+
+        broker.acknowledge_disable(client).unwrap();
+        assert_eq!(vt.calls.borrow().as_slice(), ["open:7", "ack_release"]);
+    }
+
+    #[test]
+    fn a_forced_disable_still_answers_the_kernel_release() {
+        let vt = Rc::new(FakeVt::default());
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = broker.allocate_client();
+        broker.open_seat(client, &seat, tx).unwrap();
+        broker.vt_release(&seat);
+        broker.force_disable(client);
+        assert!(vt.calls.borrow().contains(&"ack_release".to_string()));
+    }
+
+    #[test]
+    fn a_client_that_dies_during_a_release_does_not_wedge_the_switch() {
+        let vt = Rc::new(FakeVt::default());
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = broker.allocate_client();
+        broker.open_seat(client, &seat, tx).unwrap();
+        broker.vt_release(&seat);
+        broker.close_client(client);
+        assert!(vt.calls.borrow().contains(&"ack_release".to_string()));
+    }
+
+    #[test]
+    fn a_release_with_no_active_client_is_answered_at_once() {
+        let vt = Rc::new(FakeVt::default());
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        broker.vt_release(&seat);
+        assert_eq!(vt.calls.borrow().as_slice(), ["ack_release"]);
+    }
+
+    #[test]
+    fn the_next_compositor_becomes_active_once_the_previous_one_is_gone() {
+        // The sequence a display manager produces: the greeter is disabled
+        // by the switch, the kernel completes it, and the session's
+        // compositor connects on the new VT and must be able to use it.
+        let vt = Rc::new(FakeVt::default());
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        let (greeter_tx, _greeter_rx) = mpsc::unbounded_channel();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let greeter = broker.allocate_client();
+        let session = broker.allocate_client();
+        broker.open_seat(greeter, &seat, greeter_tx).unwrap();
+
+        vt.current.set(Some(7));
+        broker.vt_release(&seat);
+        broker.acknowledge_disable(greeter).unwrap();
+
+        // Only now does the kernel put VT 8 in front and let the session's
+        // compositor run.
+        vt.current.set(Some(8));
+        let opened = broker.open_seat(session, &seat, session_tx).unwrap();
+        assert_eq!(opened.session, 8);
+        assert!(opened.active);
+        assert_eq!(broker.state(session), Some(ClientState::Active));
     }
 
     #[test]
@@ -640,7 +807,12 @@ mod tests {
         broker.acknowledge_disable(first).unwrap();
         assert_eq!(broker.state(second), Some(ClientState::Active));
         assert!(matches!(rx2.try_recv(), Ok(Outbound::Packet(_, None))));
-        assert_eq!(vt.calls.borrow().as_slice(), ["open:7", "open:8"]);
+        // The kernel is answered last, after the outgoing client reports it
+        // has let go.
+        assert_eq!(
+            vt.calls.borrow().as_slice(),
+            ["open:7", "open:8", "ack_release"]
+        );
     }
 
     #[test]

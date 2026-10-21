@@ -68,6 +68,15 @@ Live DRM/input and VT verification is deferred to the two-seat M5 VM.
   or a display manager jumping to the session VT moves the foreground; the
   seat would then be bound to a terminal nobody is on, and the real terminal
   would keep whatever VT owner registered itself last.
+- **A VT release is acknowledged last.** When the kernel signals a switch
+  away from a seat's VT, the daemon disables the active client and answers
+  `VT_RELDISP` only once that client has acknowledged, or once the disable is
+  forced by the two-second timeout, or once the client disconnects. The
+  acknowledgement is what releases the switching process from
+  `VT_WAITACTIVE`, so answering it early lets a display manager start the
+  next compositor while the previous one still holds the seat; the new
+  compositor is then refused its devices and exits, which looks like a
+  graphics failure rather than a handover race.
 - **Logs at info by default.** An unset `RUST_LOG` means "error only" in
   `tracing`, which leaves a supervised daemon with an empty log. Seat opens,
   activations, VT takeovers/releases and every failed VT ioctl are logged.

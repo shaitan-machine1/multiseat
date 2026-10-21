@@ -13,6 +13,16 @@ pub trait VtOps {
     /// cached value goes stale as soon as anything else changes the VT,
     /// including every switch made before the first client connected.
     fn current(&self) -> io::Result<i32>;
+    /// Lets the kernel complete a switch away from this seat's VT.
+    ///
+    /// The kernel blocks the switching process in `VT_WAITACTIVE` until
+    /// this is sent, which is the only thing that keeps the next
+    /// compositor from being started before the previous one has given up
+    /// its devices, so it must not be sent before the client acknowledges
+    /// the disable.
+    fn ack_release(&self) -> io::Result<()>;
+    /// Confirms a switch back to this seat's VT.
+    fn ack_acquire(&self) -> io::Result<()>;
 }
 
 #[derive(Default)]
@@ -30,6 +40,12 @@ impl VtOps for NoopVtOps {
     }
     fn current(&self) -> io::Result<i32> {
         Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+    fn ack_release(&self) -> io::Result<()> {
+        Ok(())
+    }
+    fn ack_acquire(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -83,6 +99,23 @@ impl VtOps for LinuxVtOps {
     fn current(&self) -> io::Result<i32> {
         current_vt()
     }
+
+    fn ack_release(&self) -> io::Result<()> {
+        console_ack(VT_RELDISP_RELEASE)
+    }
+
+    fn ack_acquire(&self) -> io::Result<()> {
+        console_ack(VT_ACKACQ)
+    }
+}
+
+/// Answers a pending VT signal on the foreground console.
+fn console_ack(value: i32) -> io::Result<()> {
+    let console = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")?;
+    ioctl_value(&console, VT_RELDISP, value)
 }
 
 /// Reads the foreground VT from `/dev/tty0`.
@@ -119,7 +152,10 @@ const VT_AUTO: u8 = 0;
 const VT_PROCESS: u8 = 1;
 const VT_SETMODE: libc::c_ulong = 0x5602;
 const VT_GETSTATE: libc::c_ulong = 0x5603;
+const VT_RELDISP: libc::c_ulong = 0x5605;
 const VT_ACTIVATE: libc::c_ulong = 0x5606;
+const VT_RELDISP_RELEASE: i32 = 1;
+const VT_ACKACQ: i32 = 2;
 const KDSETMODE: libc::c_ulong = 0x4b3a;
 const KD_TEXT: i32 = 0;
 const KD_GRAPHICS: i32 = 1;
