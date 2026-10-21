@@ -6,6 +6,13 @@ pub trait VtOps {
     fn open(&self, vt: i32) -> io::Result<()>;
     fn close(&self, vt: i32) -> io::Result<()>;
     fn switch(&self, current: i32, target: i32) -> io::Result<()>;
+    /// The foreground virtual terminal according to the kernel.
+    ///
+    /// A VT-bound seat must resolve this whenever a client opens the seat:
+    /// the daemon only learns about switches it arbitrates itself, so a
+    /// cached value goes stale as soon as anything else changes the VT,
+    /// including every switch made before the first client connected.
+    fn current(&self) -> io::Result<i32>;
 }
 
 #[derive(Default)]
@@ -19,6 +26,9 @@ impl VtOps for NoopVtOps {
         Ok(())
     }
     fn switch(&self, _current: i32, _target: i32) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+    }
+    fn current(&self) -> io::Result<i32> {
         Err(io::Error::from_raw_os_error(libc::ENOTSUP))
     }
 }
@@ -69,6 +79,31 @@ impl VtOps for LinuxVtOps {
         let tty = Self::tty(current)?;
         ioctl_value(&tty, VT_ACTIVATE, target)
     }
+
+    fn current(&self) -> io::Result<i32> {
+        current_vt()
+    }
+}
+
+/// Reads the foreground VT from `/dev/tty0`.
+pub fn current_vt() -> io::Result<i32> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct VtStat {
+        active: u16,
+        signal: u16,
+        state: u16,
+    }
+    let console = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")?;
+    let mut state = VtStat::default();
+    // SAFETY: VT_GETSTATE fills the vt_stat structure this call owns.
+    if unsafe { libc::ioctl(console.as_raw_fd(), VT_GETSTATE, &mut state) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(i32::from(state.active))
 }
 
 #[repr(C)]
@@ -83,6 +118,7 @@ struct VtMode {
 const VT_AUTO: u8 = 0;
 const VT_PROCESS: u8 = 1;
 const VT_SETMODE: libc::c_ulong = 0x5602;
+const VT_GETSTATE: libc::c_ulong = 0x5603;
 const VT_ACTIVATE: libc::c_ulong = 0x5606;
 const KDSETMODE: libc::c_ulong = 0x4b3a;
 const KD_TEXT: i32 = 0;

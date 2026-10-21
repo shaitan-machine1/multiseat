@@ -58,3 +58,16 @@ sudo seat-launch --seat seat0 --user alice -- sway
 ```
 
 Live DRM/input and VT verification is deferred to the two-seat M5 VM.
+
+## Design notes
+
+- **The kernel owns the current VT, not the daemon.** A VT-bound seat
+  re-reads the foreground terminal (`VT_GETSTATE` on `/dev/tty0`) whenever a
+  client opens the seat. The daemon is only told about switches it arbitrates
+  itself, so a value cached at startup goes stale the moment a getty, `chvt`
+  or a display manager jumping to the session VT moves the foreground; the
+  seat would then be bound to a terminal nobody is on, and the real terminal
+  would keep whatever VT owner registered itself last.
+- **Logs at info by default.** An unset `RUST_LOG` means "error only" in
+  `tracing`, which leaves a supervised daemon with an empty log. Seat opens,
+  activations, VT takeovers/releases and every failed VT ioctl are logged.

@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 
 pub async fn serve(stream: UnixStream, seat: SeatName, broker: Rc<RefCell<Broker>>) {
     let client_id = broker.borrow_mut().allocate_client();
+    tracing::debug!(client = client_id, seat = %seat, "client connected");
     if let Err(error) = serve_inner(stream, seat, broker.clone(), client_id).await {
-        eprintln!("multiseatd: client {client_id} failed: {error}");
+        tracing::warn!(client = client_id, %error, "client failed");
     }
     broker.borrow_mut().close_client(client_id);
 }
@@ -126,8 +127,10 @@ async fn handle_packet(
             if let Some(pidfd) = opener {
                 watch_opener(pidfd, tx);
             } else {
-                eprintln!(
-                    "multiseatd: client {client_id} on {seat} supplied no opener handle; using socket lifetime"
+                tracing::info!(
+                    client = client_id,
+                    seat = %seat,
+                    "client supplied no opener handle; using socket lifetime"
                 );
             }
         }

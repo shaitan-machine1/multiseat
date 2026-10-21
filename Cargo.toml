@@ -16,4 +16,6 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 seat-udev = { git = "ssh://git@github.com/shaitan-machine1/seat-udev.git", tag = "v0.1.0" }
 thiserror = "2"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = { version = "6", default-features = false, features = ["tokio", "service"] }

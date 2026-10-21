@@ -4,7 +4,7 @@ use multiseatd::broker::Broker;
 use multiseatd::connection;
 use multiseatd::dbus::{BUS_NAME, Manager, OBJECT_PATH, SeatRegistry};
 use multiseatd::device::RealDeviceOps;
-use multiseatd::vt::LinuxVtOps;
+use multiseatd::vt::{LinuxVtOps, current_vt};
 use seat_udev::{Context, Event, SeatName};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ impl Units {
         let _ = fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-        let current_vt = if vt_bound { current_vt() } else { None };
+        let current_vt = if vt_bound { current_vt().ok() } else { None };
         self.broker
             .borrow_mut()
             .add_seat(seat.clone(), vt_bound, current_vt);
@@ -81,7 +81,7 @@ impl Units {
                         ));
                     }
                     Err(error) => {
-                        eprintln!("multiseatd: accept on {task_seat} failed: {error}");
+                        tracing::error!(seat = %task_seat, %error, "accept failed");
                         break;
                     }
                 }
@@ -112,6 +112,16 @@ impl Drop for Units {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Without an explicit default, an unset RUST_LOG means "error only",
+    // which leaves a supervised daemon with an empty log and nothing to
+    // diagnose a live seat or VT failure with.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "multiseatd=info".into()),
+        )
+        .init();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -164,6 +174,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     for seat in initial_seats.into_iter().chain(args.test_seat) {
         let added = units.add(seat.clone(), seat == SeatName::seat0()).await?;
         if added {
+            tracing::info!(seat = %seat, "serving seat");
             registry.insert(seat.as_str());
         }
     }
@@ -187,8 +198,12 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = acquire.recv() => {
                 acknowledge_vt(false);
-                if let Some(vt) = current_vt() {
-                    broker.borrow_mut().vt_acquire(&seat0, vt);
+                match current_vt() {
+                    Ok(vt) => broker.borrow_mut().vt_acquire(&seat0, vt),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "acquired a VT but could not read which one"
+                    ),
                 }
             }
             _ = interval.tick() => {
@@ -229,28 +244,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     drop(units);
     remove_dir_if_empty(&args.runtime_dir);
     Ok(())
-}
-
-fn current_vt() -> Option<i32> {
-    #[repr(C)]
-    #[derive(Default)]
-    struct VtStat {
-        active: u16,
-        signal: u16,
-        state: u16,
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty0")
-        .ok()?;
-    let mut state = VtStat::default();
-    // VT_GETSTATE from linux/vt.h.
-    if unsafe { libc::ioctl(file.as_raw_fd(), 0x5603, &mut state) } == -1 {
-        None
-    } else {
-        Some(i32::from(state.active))
-    }
 }
 
 fn acknowledge_vt(release: bool) {

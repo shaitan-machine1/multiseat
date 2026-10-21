@@ -128,6 +128,7 @@ impl Broker {
         if self.clients.contains_key(&id) {
             return Err(libc::EBUSY);
         }
+        self.refresh_current_session(name);
         let seat = self.seats.get_mut(name).ok_or(libc::ENOENT)?;
         if seat.vt_bound {
             if let Some(active) = seat.active {
@@ -159,9 +160,11 @@ impl Broker {
         let active =
             seat.active.is_none() && (!seat.vt_bound || seat.current_session == Some(session));
         if active && seat.vt_bound {
-            self.vt_ops
-                .open(session)
-                .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+            self.vt_ops.open(session).map_err(|error| {
+                tracing::error!(seat = %name, vt = session, %error, "could not take over the VT");
+                error.raw_os_error().unwrap_or(libc::EIO)
+            })?;
+            tracing::info!(seat = %name, vt = session, client = id, "took over the VT");
         }
         let state = if active {
             ClientState::Active
@@ -182,7 +185,47 @@ impl Broker {
                 devices: BTreeMap::new(),
             },
         );
+        tracing::info!(
+            seat = %name,
+            client = id,
+            session,
+            active,
+            "opened seat"
+        );
         Ok(OpenedSeat { session, active })
+    }
+
+    /// Re-reads the foreground VT of a VT-bound seat from the kernel.
+    ///
+    /// `current_session` is otherwise only written at startup and by the
+    /// release/acquire handshake, which the daemon only receives for VTs it
+    /// already owns. Anything else that switches VTs - a getty, `chvt`, or
+    /// the display manager jumping to the session VT before its compositor
+    /// connects - would leave the cache pointing at a terminal nobody is on,
+    /// and the seat would then be arbitrated against that stale terminal.
+    fn refresh_current_session(&mut self, name: &SeatName) {
+        if !self.seats.get(name).is_some_and(|seat| seat.vt_bound) {
+            return;
+        }
+        let current = match self.vt_ops.current() {
+            Ok(vt) => vt,
+            Err(error) => {
+                tracing::warn!(seat = %name, %error, "could not read the foreground VT");
+                return;
+            }
+        };
+        let Some(seat) = self.seats.get_mut(name) else {
+            return;
+        };
+        if seat.current_session != Some(current) {
+            tracing::info!(
+                seat = %name,
+                previous = ?seat.current_session,
+                current,
+                "foreground VT changed outside the daemon"
+            );
+            seat.current_session = Some(current);
+        }
     }
 
     pub fn close_client(&mut self, id: ClientId) {
@@ -202,6 +245,7 @@ impl Broker {
                 closed_active_vt = seat.vt_bound;
             }
         }
+        tracing::info!(seat = %seat_name, client = id, session, "closed client");
         self.revoke_all(client);
         self.activate_next(&seat_name);
         if closed_active_vt
@@ -210,7 +254,11 @@ impl Broker {
                 .get(&seat_name)
                 .is_some_and(|seat| seat.active.is_none())
         {
-            let _ = self.vt_ops.close(session);
+            if let Err(error) = self.vt_ops.close(session) {
+                tracing::warn!(seat = %seat_name, vt = session, %error, "could not release the VT");
+            } else {
+                tracing::info!(seat = %seat_name, vt = session, "released the VT");
+            }
         }
     }
 
@@ -303,6 +351,7 @@ impl Broker {
         }
         client.state = ClientState::Disabled;
         let seat_name = client.seat.clone();
+        tracing::warn!(client = id, seat = %seat_name, "client did not acknowledge the disable in time");
         if let Some(seat) = self.seats.get_mut(&seat_name) {
             if seat.active == Some(id) {
                 seat.active = None;
@@ -347,8 +396,16 @@ impl Broker {
 
     pub fn vt_release(&mut self, name: &SeatName) {
         let active = self.seats.get(name).and_then(|seat| seat.active);
+        tracing::info!(seat = %name, client = ?active, "VT release requested");
         if let Some(id) = active {
-            let _ = self.disable_client(id);
+            if let Err(error) = self.disable_client(id) {
+                tracing::warn!(
+                    seat = %name,
+                    client = id,
+                    errno = error,
+                    "could not disable the active client for the VT release"
+                );
+            }
         }
         if let Some(seat) = self.seats.get_mut(name) {
             seat.current_session = None;
@@ -356,6 +413,7 @@ impl Broker {
     }
 
     pub fn vt_acquire(&mut self, name: &SeatName, session: i32) {
+        tracing::info!(seat = %name, vt = session, "VT acquired");
         if let Some(seat) = self.seats.get_mut(name) {
             seat.current_session = Some(session);
         }
@@ -396,6 +454,7 @@ impl Broker {
         }
         client.devices.clear();
         client.state = ClientState::PendingDisable;
+        tracing::info!(client = id, seat = %client.seat, "disabling client");
         client
             .tx
             .send(Outbound::Packet(
@@ -435,11 +494,19 @@ impl Broker {
         let Some(client) = self.clients.get_mut(&id) else {
             return;
         };
-        if self.seats.get(name).is_some_and(|seat| seat.vt_bound)
-            && self.vt_ops.open(client.session).is_err()
-        {
-            return;
+        if self.seats.get(name).is_some_and(|seat| seat.vt_bound) {
+            if let Err(error) = self.vt_ops.open(client.session) {
+                tracing::error!(
+                    seat = %name,
+                    client = id,
+                    vt = client.session,
+                    %error,
+                    "could not take over the VT; leaving the seat inactive"
+                );
+                return;
+            }
         }
+        tracing::info!(seat = %name, client = id, session = client.session, "activated client");
         client.state = ClientState::Active;
         if let Some(seat) = self.seats.get_mut(name) {
             seat.active = Some(id);
@@ -522,9 +589,18 @@ mod tests {
     #[derive(Default)]
     struct FakeVt {
         calls: RefCell<Vec<String>>,
+        /// `None` makes the kernel query fail, which keeps the seat on its
+        /// cached VT the way the daemon behaves on a system without VTs.
+        current: Cell<Option<i32>>,
     }
 
     impl VtOps for FakeVt {
+        fn current(&self) -> io::Result<i32> {
+            self.current
+                .get()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTSUP))
+        }
+
         fn open(&self, vt: i32) -> io::Result<()> {
             self.calls.borrow_mut().push(format!("open:{vt}"));
             Ok(())
@@ -565,6 +641,53 @@ mod tests {
         assert_eq!(broker.state(second), Some(ClientState::Active));
         assert!(matches!(rx2.try_recv(), Ok(Outbound::Packet(_, None))));
         assert_eq!(vt.calls.borrow().as_slice(), ["open:7", "open:8"]);
+    }
+
+    #[test]
+    fn open_seat_prefers_the_kernel_vt_over_the_cached_one() {
+        // The daemon started while VT 7 was in front, then something it does
+        // not arbitrate - a getty, chvt, or a display manager jumping to the
+        // session VT before its compositor connects - moved the foreground
+        // to VT 1. The client must be bound to VT 1, and VT 1 is the
+        // terminal whose switches the daemon must take over.
+        let vt = Rc::new(FakeVt::default());
+        vt.current.set(Some(1));
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::seat0();
+        broker.add_seat(seat.clone(), true, Some(7));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = broker.allocate_client();
+        let opened = broker.open_seat(client, &seat, tx).unwrap();
+        assert_eq!(opened.session, 1);
+        assert!(opened.active);
+        assert_eq!(vt.calls.borrow().as_slice(), ["open:1"]);
+
+        // Closing the client releases the VT it actually held.
+        broker.close_client(client);
+        assert_eq!(vt.calls.borrow().as_slice(), ["open:1", "close:1"]);
+    }
+
+    #[test]
+    fn non_vt_seats_never_consult_the_kernel_vt() {
+        let vt = Rc::new(FakeVt::default());
+        vt.current.set(Some(1));
+        let mut broker = Broker::with_vt(
+            Rc::new(FakeAuthority),
+            Rc::new(FakeOps::default()),
+            vt.clone(),
+        );
+        let seat = SeatName::parse("seat1").unwrap();
+        broker.add_seat(seat.clone(), false, None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = broker.allocate_client();
+        let opened = broker.open_seat(client, &seat, tx).unwrap();
+        assert_eq!(opened.session, 1);
+        assert!(opened.active);
+        assert!(vt.calls.borrow().is_empty());
     }
 
     #[test]
