@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/multiseatd", "crates/multiseatctl", "crates/seat-launch"]
+members = [
+  "crates/multiseat-api",
+  "crates/multiseatd",
+  "crates/seat-launch",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +16,7 @@ rust-version = "1.85"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 libc = "0.2"
+multiseat-api = { path = "crates/multiseat-api" }
 nix = { version = "0.31", features = ["fs", "ioctl", "process", "signal", "socket", "uio", "user"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 seat-udev = { git = "ssh://git@github.com/shaitan-machine1/seat-udev.git", tag = "v0.1.0" }

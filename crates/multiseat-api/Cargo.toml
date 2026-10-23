@@ -1,11 +1,9 @@
 [package]
-name = "multiseatctl"
+name = "multiseat-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap.workspace = true
-tokio.workspace = true
 zbus.workspace = true

@@ -1,4 +1,5 @@
 use crate::orchestrator::{Orchestrator, RefreshChange};
+pub use multiseat_api::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH, RefreshDescription};
 use seat_udev::SeatName;
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
@@ -8,12 +9,6 @@ use zbus::fdo;
 use zbus::message::Header;
 use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
-
-pub const BUS_NAME: &str = "org.decoupling.multiseatd1";
-pub const OBJECT_PATH: &str = "/org/decoupling/multiseatd1";
-pub const INTERFACE_NAME: &str = "org.decoupling.multiseatd1.Manager";
-
-pub type RefreshDescription = (String, String, Vec<String>, Vec<String>);
 
 #[derive(Clone, Default)]
 pub struct SeatRegistry {

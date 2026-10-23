@@ -76,7 +76,8 @@ echo "$result" | grep -q 'seat1'
 [ "$(sudo stat -c %a "$work/run/seat1.sock")" = 600 ]
 sudo "$repo/target/debug/seat-launch" --seat seat1 --user nobody \
     --runtime-dir "$work/run" -- "$work/client"
-sudo env DBUS_SYSTEM_BUS_ADDRESS="$address" \
-    "$repo/target/debug/multiseatctl" --bus system refresh seat1 --force \
-    | grep -q 'No seat configuration changes'
+preview=$(busctl --address="$address" call org.decoupling.multiseatd1 \
+    /org/decoupling/multiseatd1 org.decoupling.multiseatd1.Manager \
+    PreviewRefresh s seat1)
+echo "$preview" | grep -q '^a(ssasas) 0$'
 echo "multiseatd/s6/seatd/libseat inherited-fd end-to-end test passed"

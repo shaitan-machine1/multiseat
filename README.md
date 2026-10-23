@@ -5,7 +5,8 @@ Rust topology and orchestration tools for one seatd process per udev seat.
 - `multiseatd` takes a fresh udev snapshot at startup and on explicit refresh,
   compares it with immutable deployed service manifests, and controls transient
   seatd services through s6 CLI tools.
-- `multiseatctl` lists published seats and previews/confirms disruptive refresh.
+- `multiseat-api` publishes typed zbus proxies and protocol constants for
+  external administrative clients.
 - `seat-launch` remains a root development launcher for passing a connected
   seat socket to an unprivileged libseat compositor.
 
@@ -47,19 +48,11 @@ awaited, and published again.
 
 ## Explicit refresh
 
-Topology does not change until requested:
-
-```sh
-sudo multiseatctl list
-sudo multiseatctl refresh seat1
-sudo multiseatctl refresh --force
-```
-
-The CLI prints old/new allowlists, any sessiond sessions it can query, and a
-warning that graphical sessions may be terminated. Without `--force` it asks
-for confirmation. The D-Bus mutation also requires an explicit confirmation
-argument and independently verifies that the caller uid is root. Refreshes are
-serialized.
+Topology does not change until requested through the public D-Bus API. The
+separate unified `loginctl` client lists seats and previews/confirms disruptive
+refresh; this repository intentionally ships no component-specific CLI. The
+D-Bus mutation requires an explicit confirmation argument and independently
+verifies that the caller uid is root. Refreshes are serialized.
 
 D-Bus:
 

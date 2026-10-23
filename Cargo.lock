@@ -387,11 +387,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "multiseatctl"
+name = "multiseat-api"
 version = "0.1.0"
 dependencies = [
- "clap",
- "tokio",
  "zbus",
 ]
 
@@ -401,6 +399,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "multiseat-api",
  "seat-udev",
  "serde",
  "serde_json",
