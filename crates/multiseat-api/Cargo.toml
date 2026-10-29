@@ -6,4 +6,4 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-zbus.workspace = true
+dbus.workspace = true

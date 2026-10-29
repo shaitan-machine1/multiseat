@@ -5,8 +5,9 @@ Rust topology and orchestration tools for one seatd process per udev seat.
 - `multiseatd` takes a fresh udev snapshot at startup and on explicit refresh,
   compares it with immutable deployed service manifests, and controls transient
   seatd services through s6 CLI tools.
-- `multiseat-api` publishes typed zbus proxies and protocol constants for
-  external administrative clients.
+- `multiseat-api` publishes a genuinely blocking `dbus` client and protocol
+  types for synchronous administrative clients. The daemon itself remains on
+  its existing async service implementation.
 - `seat-launch` remains a root development launcher for passing a connected
   seat socket to an unprivileged libseat compositor.
 
