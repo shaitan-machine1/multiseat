@@ -106,9 +106,16 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Run root harnesses as the normal user; they use passwordless sudo. Missing
 prerequisites return status 77. They use temporary private buses, socketpairs,
-non-VT synthetic seats and the sibling patched seatd/libseat checkout, not s6,
-physical seat devices or the live system bus. `LIBSEAT_REPO` can select a
-separate patched libseat source checkout.
+non-VT synthetic seats and a patched seatd/libseat checkout, not s6, physical
+seat devices or the live system bus.
+
+The harnesses do not assume a sibling checkout. `tests/libseat-source.sh`
+clones the pinned fork from
+`https://github.com/shaitan-machine1/seatd.git` at commit `7813c08` into the
+gitignored `.test-libseat/` cache on first use, and skips with status 77 when
+the clone is unavailable. `LIBSEAT_URL`, `LIBSEAT_COMMIT` and `LIBSEAT_CACHE`
+override the remote, revision and cache location; `LIBSEAT_REPO` can point at
+an existing local checkout instead.
 
 The first harness covers real libseat open/device/close and sequential reopen
 through a retained duplicate. The private-bus harness verifies independent

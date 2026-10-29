@@ -2,11 +2,21 @@
 # Rust seatd-server + patched real libseat inherited-FD compatibility test.
 set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-libseat_repo=${LIBSEAT_REPO:-"$repo/../seatd"}
+# shellcheck source=tests/libseat-source.sh
+. "$repo/tests/libseat-source.sh"
 for command in cargo cc meson ninja sudo; do
     command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 77; }
 done
 sudo -n true || { echo "passwordless sudo is required" >&2; exit 77; }
+set +e
+libseat_repo=$(resolve_libseat_source)
+resolved=$?
+set -e
+if (( resolved == 77 )); then
+    echo "SKIP: could not fetch the patched libseat source" >&2
+    exit 77
+fi
+(( resolved == 0 )) || { echo "invalid LIBSEAT_REPO" >&2; exit 1; }
 
 work=$(mktemp -d /tmp/seatd-server-libseat.XXXXXX)
 cleanup() {

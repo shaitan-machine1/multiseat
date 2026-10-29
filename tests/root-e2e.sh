@@ -2,12 +2,22 @@
 # Embedded daemon + D-Bus seat-launch + real patched libseat. No live devices.
 set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-libseat_repo=${LIBSEAT_REPO:-"$repo/../seatd"}
+# shellcheck source=tests/libseat-source.sh
+. "$repo/tests/libseat-source.sh"
 for tool in cargo cc dbus-daemon busctl meson ninja sudo timeout; do
     command -v "$tool" >/dev/null || { echo "missing command: $tool" >&2; exit 77; }
 done
 sudo -n true || exit 77
 id nobody >/dev/null 2>&1 || exit 77
+set +e
+libseat_repo=$(resolve_libseat_source)
+resolved=$?
+set -e
+if (( resolved == 77 )); then
+    echo "SKIP: could not fetch the patched libseat source" >&2
+    exit 77
+fi
+(( resolved == 0 )) || { echo "invalid LIBSEAT_REPO" >&2; exit 1; }
 cargo build --manifest-path "$repo/Cargo.toml" --workspace --bins
 work=$(mktemp -d /tmp/multiseat-root-e2e.XXXXXX)
 chmod 755 "$work"
