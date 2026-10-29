@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node>
+  <interface name="org.decoupling.multiseatd1.Manager">
+    <method name="ListSeats"><arg name="seats" type="as" direction="out"/></method>
+    <method name="CreateClient">
+      <arg name="seat_name" type="s" direction="in"/><arg name="uid" type="u" direction="in"/>
+      <arg name="client_id" type="s" direction="out"/><arg name="fd" type="h" direction="out"/>
+    </method>
+    <method name="RevokeClient"><arg name="client_id" type="s" direction="in"/></method>
+    <method name="ListClients"><arg name="clients" type="a(ssus)" direction="out"/></method>
+    <signal name="SeatNew"><arg name="seat" type="s"/></signal>
+    <signal name="SeatRemoved"><arg name="seat" type="s"/></signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable"><method name="Introspect"><arg type="s" direction="out"/></method></interface>
+  <interface name="org.freedesktop.DBus.Peer"><method name="Ping"/></interface>
+</node>

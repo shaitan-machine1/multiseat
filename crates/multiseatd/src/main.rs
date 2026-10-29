@@ -1,104 +1,208 @@
 use clap::{Parser, ValueEnum};
-use multiseatd::dbus::{BUS_NAME, Manager, OBJECT_PATH, SeatRegistry};
-use multiseatd::orchestrator::Orchestrator;
-use multiseatd::service::S6SeatServiceManager;
-use multiseatd::topology::UdevTopology;
-use seat_udev::SeatName;
+use multiseatd::acl::LibAcl;
+use multiseatd::dbus::Bus;
+use multiseatd::orchestrator::{OperationTimer, Orchestrator};
+use multiseatd::topology::Snapshot;
+use nix::poll::{PollFd, PollFlags, poll};
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
+use seat_udev::{Context, SeatName};
+use seatd_server::{AllowedDevice, DeviceId, DeviceKind, ServerRuntime};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BusKind {
     System,
     Session,
 }
-
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Orchestrate one s6-supervised seatd process per udev seat"
+    about = "Continuously coordinate embedded seatd actors and direct-access UID leases"
 )]
 struct Args {
-    #[arg(long, default_value = "/run/multiseatd")]
-    runtime_dir: PathBuf,
-    #[arg(long, default_value = "/usr/bin/seatd")]
-    seatd_program: PathBuf,
-    #[arg(long, default_value_t = 10_000)]
-    readiness_timeout_ms: u64,
     #[arg(long, value_enum, default_value_t = BusKind::System)]
     bus: BusKind,
-    /// Add an empty non-VT seat independently of udev (local testing only).
     #[arg(long, hide = true)]
     test_seat: Vec<SeatName>,
+    /// Use synthetic non-VT seats only; never enumerate or change live devices.
+    #[arg(long, hide = true)]
+    test_only: bool,
+    /// Explicit synthetic authorization for integration tests, never production.
+    #[arg(long, hide = true, requires = "test_only")]
+    test_device: Vec<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "multiseatd=info".into()),
+                .unwrap_or_else(|_| "multiseatd=info,seatd_server=info".into()),
         )
         .init();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(run(Args::parse()))
+    let args = Args::parse();
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("multiseatd must run as root".into());
+    }
+    let mut shutdown_mask = SigSet::empty();
+    shutdown_mask.add(Signal::SIGTERM);
+    shutdown_mask.add(Signal::SIGINT);
+    shutdown_mask.thread_block()?;
+    let mut shutdown_signal = SignalFd::with_flags(
+        &shutdown_mask,
+        SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK,
+    )?;
+    // Must precede all actor threads; their signal masks are inherited.
+    let runtime = ServerRuntime::initialize()?;
+    let mut context = if args.test_only {
+        None
+    } else {
+        Some(Context::new()?)
+    };
+    let initial = if let Some(context) = &context {
+        Snapshot::from_context(context, &args.test_seat)?
+    } else {
+        if args.test_seat.is_empty() || args.test_seat.contains(&SeatName::seat0()) {
+            return Err("--test-only requires at least one non-VT --test-seat".into());
+        }
+        let mut snapshot = Snapshot {
+            seats: args.test_seat.iter().cloned().collect(),
+            ..Snapshot::default()
+        };
+        for path in &args.test_device {
+            let device = AllowedDevice::canonicalized(
+                DeviceId::new(path.to_string_lossy()),
+                path,
+                std::fs::metadata(path)?.rdev(),
+                DeviceKind::Evdev,
+            )?;
+            snapshot
+                .brokered
+                .entry(args.test_seat[0].clone())
+                .or_default()
+                .push(device);
+        }
+        snapshot
+    };
+    let mut coordinator = Orchestrator::new(runtime, LibAcl, &initial)?;
+    coordinator.reconcile_topology(&initial, |_, _| {})?;
+    // No D-Bus name is owned until initial ACL and brokered state are ready.
+    let bus = Bus::new(matches!(args.bus, BusKind::Session))?;
+    let result = run_loop(
+        &args,
+        &bus,
+        &mut coordinator,
+        &mut context,
+        &mut shutdown_signal,
+    );
+    let cleanup = coordinator.shutdown();
+    result?;
+    cleanup?;
+    Ok(())
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let topology = UdevTopology::new(args.runtime_dir.clone(), args.test_seat);
-    let services = S6SeatServiceManager::new(
-        args.runtime_dir,
-        args.seatd_program,
-        args.readiness_timeout_ms,
-    )?;
-    let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
-        Box::new(topology),
-        Box::new(services),
-    )));
-
-    let registry = SeatRegistry::default();
-    {
-        let orchestrator = orchestrator.lock().await;
-        for failure in orchestrator.converge_startup()? {
-            tracing::error!(%failure, "could not converge seat during startup");
+fn run_loop(
+    args: &Args,
+    bus: &Bus,
+    coordinator: &mut Orchestrator,
+    context: &mut Option<Context>,
+    shutdown: &mut SignalFd,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut immediate = false;
+    let mut pending = None;
+    let mut next_retry = Instant::now() + Duration::from_secs(1);
+    let mut next_topology_retry = Instant::now();
+    loop {
+        if !bus.connected() {
+            return Err("lost the D-Bus connection".into());
         }
-        for seat in orchestrator.ready_seats()? {
-            tracing::info!(seat = %seat, "publishing ready seat");
-            registry.insert(&seat);
+        let watch = bus.watch();
+        let deadline = if pending.is_some() {
+            next_retry.min(next_topology_retry)
+        } else {
+            next_retry
+        };
+        let timeout = if immediate {
+            0
+        } else {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(1000) as u16
+        };
+        {
+            // SAFETY: the bus connection owns this FD throughout the poll.
+            let bus_fd = unsafe { BorrowedFd::borrow_raw(watch.fd) };
+            let mut flags = PollFlags::POLLIN;
+            if watch.write || bus.has_output() {
+                flags |= PollFlags::POLLOUT;
+            }
+            let mut polls = vec![
+                PollFd::new(bus_fd, flags),
+                PollFd::new(coordinator.event_fd(), PollFlags::POLLIN),
+                PollFd::new(shutdown.as_fd(), PollFlags::POLLIN),
+            ];
+            if let Some(context) = context.as_ref() {
+                polls.push(PollFd::new(context.monitor_fd(), PollFlags::POLLIN));
+            }
+            match poll(&mut polls, timeout) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-    }
-
-    let builder = match args.bus {
-        BusKind::System => zbus::connection::Builder::system(),
-        BusKind::Session => zbus::connection::Builder::session(),
-    };
-    let connection = builder.build().await?;
-    connection
-        .object_server()
-        .at(
-            OBJECT_PATH,
-            Manager::new(registry.clone(), orchestrator.clone()),
-        )
-        .await?;
-    match connection
-        .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
-        .await
-    {
-        Ok(_) => {}
-        Err(zbus::Error::NameTaken) => {
-            return Err(format!(
-                "{BUS_NAME} is already owned on this bus; another multiseatd is running"
-            )
-            .into());
+        if shutdown.read_signal()?.is_some() {
+            return Ok(());
         }
-        Err(error) => return Err(error.into()),
+        // Actor failures and EOF take priority over new D-Bus work.
+        coordinator.process_events()?;
+        if let Some(context) = context.as_mut() {
+            let _timer = OperationTimer::new("udev event batch");
+            let mut changed = false;
+            for _ in 0..64 {
+                let Some(events) = context.receive()? else {
+                    break;
+                };
+                changed |= !events.is_empty();
+            }
+            if changed {
+                pending = Some(Snapshot::from_context(context, &args.test_seat)?);
+            }
+        }
+        if pending.is_some()
+            && Instant::now() >= next_topology_retry
+            && let Some(desired) = pending.as_ref()
+        {
+            let mut signal_error = None;
+            match coordinator.reconcile_topology(desired, |new, seat| {
+                if let Err(error) = bus.signal(new, seat) {
+                    signal_error = Some(error);
+                }
+            }) {
+                Ok(()) => {
+                    pending = None;
+                    next_topology_retry = Instant::now();
+                }
+                Err(error) => {
+                    // A persistent ACL/ioctl failure must not turn into a poll
+                    // spin or block unrelated D-Bus dispatch.
+                    next_topology_retry = Instant::now() + Duration::from_secs(1);
+                    tracing::error!(%error, "topology convergence failed; retaining desired state for retry");
+                }
+            }
+            if let Some(error) = signal_error {
+                return Err(error.into());
+            }
+        }
+        if Instant::now() >= next_retry {
+            if let Err(error) = coordinator.retry_access() {
+                tracing::error!(%error, "ACL convergence retry failed");
+            }
+            next_retry = Instant::now() + Duration::from_secs(1);
+        }
+        immediate = bus.dispatch(coordinator)?;
     }
-
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = connection.closed() => return Err("lost the D-Bus connection".into()),
-    }
-    Ok(())
 }

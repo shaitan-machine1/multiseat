@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/multiseat-api",
+  "crates/lib-multiseatd",
   "crates/multiseatd",
   "crates/seat-launch",
+  "crates/seat-udev",
+  "crates/seatd-server",
 ]
 
 [workspace.package]
@@ -17,15 +19,14 @@ clap = { version = "4.5", features = ["derive"] }
 dbus = "0.9.12"
 hex = "0.4"
 libc = "0.2"
-multiseat-api = { path = "crates/multiseat-api" }
-nix = { version = "0.31", features = ["fs", "ioctl", "process", "signal", "socket", "uio", "user"] }
+lib-multiseatd = { path = "crates/lib-multiseatd" }
+nix = { version = "0.31", features = ["event", "fs", "ioctl", "poll", "process", "signal", "socket", "time", "uio", "user"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
-seat-udev = { git = "ssh://git@github.com/shaitan-machine1/seat-udev.git", tag = "v0.1.0" }
+seat-udev = { path = "crates/seat-udev" }
+seatd-server = { path = "crates/seatd-server" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"] }
+udev = "0.9.3"
+uuid = { version = "1", features = ["v4", "v7"] }

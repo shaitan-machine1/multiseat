@@ -3,10 +3,9 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Uid, User, execvp, fork, initgroups, setgid, setuid};
 use seat_udev::SeatName;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, IntoRawFd};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,8 +17,6 @@ struct Args {
     seat: SeatName,
     #[arg(long)]
     user: String,
-    #[arg(long, default_value = "/run/multiseatd")]
-    runtime_dir: PathBuf,
     #[arg(long, default_value_t = 3)]
     fd: i32,
     #[arg(required = true, trailing_var_arg = true)]
@@ -41,29 +38,50 @@ fn run(args: Args) -> Result<u8, Box<dyn std::error::Error>> {
         return Err("inherited descriptor must be at least 3".into());
     }
     let user = resolve_user(&args.user)?.ok_or("unknown user")?;
-    let socket = args.runtime_dir.join(format!("{}.sock", args.seat));
-    let connection = UnixStream::connect(&socket)?;
-
-    // SAFETY: seat-launch is deliberately single-threaded and performs only
-    // child setup followed by exec in the child branch.
-    match unsafe { fork()? } {
-        ForkResult::Parent { child } => {
+    let client = libmultiseatd::Client::system(Duration::from_secs(5))?;
+    let (id, connection) = client.create_client(args.seat.as_str(), user.uid.as_raw())?;
+    // Do not copy a D-Bus connection into the child lineage.
+    drop(client);
+    // SAFETY: seat-launch is single-threaded; the child sets up and execs.
+    let result = match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => {
             drop(connection);
-            let code = match waitpid(child, None)? {
-                WaitStatus::Exited(_, code) => code.clamp(0, 255) as u8,
-                WaitStatus::Signaled(_, signal, _) => (128 + signal as i32).clamp(0, 255) as u8,
-                _ => 1,
-            };
-            Ok(code)
+            loop {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => break Ok(code.clamp(0, 255) as u8),
+                    Ok(WaitStatus::Signaled(_, signal, _)) => {
+                        break Ok((128 + signal as i32).clamp(0, 255) as u8);
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(error) => break Err(error.into()),
+                    _ => continue,
+                }
+            }
         }
-        ForkResult::Child => child_exec(args, user, connection),
+        Ok(ForkResult::Child) => return child_exec(args, user, connection),
+        Err(error) => {
+            drop(connection);
+            Err(error.into())
+        }
+    };
+    // EOF is normal lifetime; explicit revoke covers leaked compositor copies
+    // and startup failure. It is safe if EOF already removed the lease. A lost
+    // bus or daemon must not rewrite the compositor's exit status.
+    match libmultiseatd::Client::system(Duration::from_secs(5))
+        .and_then(|client| client.revoke_client(&id))
+    {
+        Ok(()) => result,
+        Err(error) => {
+            eprintln!("seat-launch: could not revoke client {id}: {error}");
+            result
+        }
     }
 }
 
 fn child_exec(
     args: Args,
     user: User,
-    connection: UnixStream,
+    connection: OwnedFd,
 ) -> Result<u8, Box<dyn std::error::Error>> {
     let raw = connection.as_raw_fd();
     if raw != args.fd {

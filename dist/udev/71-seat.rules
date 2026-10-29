@@ -1,0 +1,57 @@
+# Seat membership tagging for the decoupled login stack.
+#
+# Replaces the file of the same name that systemd/elogind install: without
+# it no device carries the "seat" or "master-of-seat" tag, seat-udev sees no
+# devices, multiseatd publishes no seat, and nothing graphical can start.
+#
+# Ordering: 70-uaccess.rules (aclad) must run first, 73-seat-late.rules
+# (this package) must run last.
+
+ACTION=="remove", GOTO="seat_end"
+
+# Anything a user may access on an active session belongs to a seat. Sound
+# cards are excluded here and matched by subsystem below, because their
+# sub-devices must not each become seat members.
+TAG=="uaccess", SUBSYSTEM!="sound", TAG+="seat"
+SUBSYSTEM=="sound", KERNEL=="card*", TAG+="seat"
+SUBSYSTEM=="input", KERNEL=="input*", TAG+="seat"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", TAG+="seat"
+SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", TAG+="seat"
+
+# Keyboard and panel backlights follow their seat.
+SUBSYSTEM=="leds", TAG+="seat"
+SUBSYSTEM=="backlight", TAG+="seat"
+
+# A DRM card is what makes a seat usable, so it may be a seat master.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", TAG+="seat", TAG+="master-of-seat"
+
+# Without KMS the framebuffer device is the only display, so let it be the
+# master instead.
+SUBSYSTEM=="graphics", KERNEL=="fb[0-9]", IMPORT{cmdline}="nomodeset", TAG+="master-of-seat"
+
+# Same for a display controller the kernel has no driver for.
+SUBSYSTEM=="pci", ENV{ID_PCI_CLASS_FROM_DATABASE}=="Display controller", \
+                  ENV{DRIVER}=="", IMPORT{cmdline}="nomodeset", TAG+="seat", TAG+="master-of-seat"
+
+# Hardware known to need the framebuffer path is flagged by hwdb.
+SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", ATTRS{modalias}=="?*", IMPORT{builtin}="hwdb fb:$attr{modalias}"
+ENV{ID_TAG_MASTER_OF_SEAT}=="1", TAG+="master-of-seat"
+
+# Individual USB ports and whole hubs may be assigned to a seat, which is how
+# a second seat is built out of one machine.
+SUBSYSTEM=="usb", ATTR{bDeviceClass}=="00", TAG+="seat"
+SUBSYSTEM=="usb", ATTR{bDeviceClass}=="09", TAG+="seat"
+
+# Devices that announce a complete seat of their own.
+# 'Plugable' USB hub with sound, network and graphics.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2230", ATTR{idProduct}=="000[13]", ENV{ID_AUTOSEAT}="1"
+# qemu's -device pci-bridge-seat, which groups one seat's devices.
+SUBSYSTEM=="pci", ATTR{vendor}=="0x1b36", ATTR{device}=="0x000a", TAG+="seat", ENV{ID_AUTOSEAT}="1"
+
+# A stable name for the device a seat assignment is written against.
+# loginctl writes rules matching ID_FOR_SEAT, so it must be set before
+# 72-seat-*.rules runs.
+TAG=="seat", ENV{ID_PATH}=="", IMPORT{builtin}="path_id"
+TAG=="seat", ENV{ID_FOR_SEAT}=="", ENV{ID_PATH_TAG}!="", ENV{ID_FOR_SEAT}="$env{SUBSYSTEM}-$env{ID_PATH_TAG}"
+
+LABEL="seat_end"

@@ -1,0 +1,21 @@
+[package]
+name = "seat-udev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+assign = ["dep:nix", "dep:uuid"]
+
+[dependencies]
+libc.workspace = true
+nix = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+udev.workspace = true
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

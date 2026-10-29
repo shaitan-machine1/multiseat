@@ -1,0 +1,20 @@
+# Seat resolution for the decoupled login stack; runs after the persistent
+# assignments written by loginctl as 72-seat-<ID_FOR_SEAT>.rules.
+#
+# Unlike systemd's file of the same name this does not run the "uaccess"
+# builtin: aclad owns device ACLs and applies them from session state.
+
+ACTION=="remove", GOTO="seat_late_end"
+
+# A device that announces a complete seat becomes its own seat unless an
+# explicit assignment already named one.
+ENV{ID_SEAT}=="", ENV{ID_AUTOSEAT}=="1", ENV{ID_FOR_SEAT}!="", ENV{ID_SEAT}="seat-$env{ID_FOR_SEAT}"
+
+# Everything else inherits its seat from the nearest assigned ancestor.
+# Devices that inherit nothing are seat0 by definition and carry no ID_SEAT.
+ENV{ID_SEAT}=="", IMPORT{parent}="ID_SEAT"
+
+# Enumerating one seat's devices by tag.
+ENV{ID_SEAT}!="", TAG+="$env{ID_SEAT}"
+
+LABEL="seat_late_end"
