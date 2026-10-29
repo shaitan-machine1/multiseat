@@ -1,0 +1,81 @@
+# Devices whose access follows the active local session.
+#
+# Replaces the file of the same name that systemd/elogind install. Only the
+# tag is set here: multiseatd, not udev's "uaccess" builtin, applies the ACLs,
+# because the builtin asks logind which session is active.
+#
+# Ordering: this must run before 71-seat.rules, which makes every uaccess
+# device a seat member.
+
+ACTION=="remove", GOTO="uaccess_end"
+ENV{MAJOR}=="", GOTO="uaccess_end"
+
+# Cameras and portable media players
+SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:060101:*", TAG+="uaccess"
+ENV{ID_GPHOTO2}=="?*", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{ID_MEDIA_PLAYER}=="?*", TAG+="uaccess"
+
+# Scanners and printers that need direct device access
+ENV{libsane_matched}=="yes", TAG+="uaccess"
+ENV{ID_HPLIP}=="1", TAG+="uaccess"
+
+# Optical drives
+SUBSYSTEM=="block", ENV{ID_CDROM}=="1", TAG+="uaccess"
+SUBSYSTEM=="scsi_generic", SUBSYSTEMS=="scsi", ATTRS{type}=="4|5", TAG+="uaccess"
+
+# Sound
+SUBSYSTEM=="sound", TAG+="uaccess", \
+  OPTIONS+="static_node=snd/timer", OPTIONS+="static_node=snd/seq"
+
+# Video capture
+SUBSYSTEM=="video4linux", TAG+="uaccess"
+SUBSYSTEM=="dvb", TAG+="uaccess"
+SUBSYSTEM=="media", TAG+="uaccess"
+KERNEL=="udmabuf", TAG+="uaccess"
+
+# FireWire audio/video units
+SUBSYSTEM=="firewire", TEST=="units", ENV{IEEE1394_UNIT_FUNCTION_MIDI}=="1", TAG+="uaccess"
+SUBSYSTEM=="firewire", TEST=="units", ENV{IEEE1394_UNIT_FUNCTION_AUDIO}=="1", TAG+="uaccess"
+SUBSYSTEM=="firewire", TEST=="units", ENV{IEEE1394_UNIT_FUNCTION_VIDEO}=="1", TAG+="uaccess"
+
+# Display devices. Cards are also brokered by multiseatd for the session's
+# compositor; the ACL is what lets anything else on the active seat use them.
+SUBSYSTEM=="drm", KERNEL=="card*", TAG+="uaccess"
+# Render and accel nodes carry no modesetting rights. They matter here only
+# where they are not already world-accessible.
+SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="uaccess"
+SUBSYSTEM=="accel", KERNEL=="accel*", TAG+="uaccess"
+SUBSYSTEM=="kfd", KERNEL=="kfd", TAG+="uaccess"
+
+# Security tokens, smart cards and hardware wallets
+ENV{ID_SMARTCARD_READER}=="?*", TAG+="uaccess"
+ENV{ID_SECURITY_TOKEN}=="?*", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{ID_HARDWARE_WALLET}=="1", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_HARDWARE_WALLET}=="1", TAG+="uaccess"
+
+# Handhelds and remote controls
+ENV{ID_PDA}=="?*", TAG+="uaccess"
+ENV{ID_REMOTE_CONTROL}=="1", TAG+="uaccess"
+
+# Joysticks and 3D mice
+SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="?*", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_INPUT_3D_MOUSE}=="1", TAG+="uaccess"
+
+# Measurement and monitor control
+ENV{COLOR_MEASUREMENT_DEVICE}=="?*", TAG+="uaccess"
+ENV{DDC_DEVICE}=="?*", TAG+="uaccess"
+
+# Radios and instruments
+ENV{ID_SOFTWARE_RADIO}=="?*", TAG+="uaccess"
+ENV{ID_MAKER_TOOL}=="?*", TAG+="uaccess"
+ENV{ID_SIGNAL_ANALYZER}=="?*", ENV{DEVTYPE}=="usb_device", TAG+="uaccess"
+ENV{ID_SIGNAL_ANALYZER}=="?*", KERNEL=="ttyACM[0-9]*", TAG+="uaccess"
+KERNEL=="rfkill", SUBSYSTEM=="misc", TAG+="uaccess"
+
+# AV production controllers and lights
+SUBSYSTEM=="hidraw", ENV{ID_AV_PRODUCTION_CONTROLLER}=="1", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{ID_AV_PRODUCTION_CONTROLLER}=="1", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_AV_LIGHTS}=="1", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{ID_AV_LIGHTS}=="1", TAG+="uaccess"
+
+LABEL="uaccess_end"

@@ -1,10 +1,10 @@
 # Seat membership tagging for the decoupled login stack.
 #
 # Replaces the file of the same name that systemd/elogind install: without
-# it no device carries the "seat" or "master-of-seat" tag, seat-udev sees no
-# devices, multiseatd publishes no seat, and nothing graphical can start.
+# it no device carries the "seat" or "master-of-seat" tag, multiseatd sees no
+# devices, publishes no seat, and nothing graphical can start.
 #
-# Ordering: 70-uaccess.rules (aclad) must run first, 73-seat-late.rules
+# Ordering: 70-uaccess.rules from this package must run first, 73-seat-late.rules
 # (this package) must run last.
 
 ACTION=="remove", GOTO="seat_end"

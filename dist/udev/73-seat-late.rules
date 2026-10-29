@@ -2,7 +2,7 @@
 # assignments written by loginctl as 72-seat-<ID_FOR_SEAT>.rules.
 #
 # Unlike systemd's file of the same name this does not run the "uaccess"
-# builtin: aclad owns device ACLs and applies them from session state.
+# builtin: multiseatd owns device ACLs and applies them from client leases.
 
 ACTION=="remove", GOTO="seat_late_end"
 
