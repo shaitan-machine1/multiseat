@@ -10,7 +10,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLIENT_PACKET_BATCH: usize = 32;
 const VT_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -26,6 +26,7 @@ pub enum SeatEvent {
     ClientGone {
         seat: String,
         client: ClientId,
+        cleanup_pending: bool,
     },
     ClientStateChanged {
         seat: String,
@@ -96,8 +97,9 @@ impl ServerRuntime {
         self.spawn_with_ops(config, Box::<KernelDeviceOps>::default(), vt_ops)
     }
 
-    #[cfg(test)]
-    fn spawn_with_device_ops(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn spawn_with_device_ops(
         &self,
         config: SeatConfig,
         device_ops: Box<dyn DeviceOps>,
@@ -204,6 +206,7 @@ enum Command {
     RemoveDevice(DeviceId, Reply),
     AddClient(ClientId, OwnedFd, Reply),
     RevokeClient(ClientId, Reply),
+    RetryCleanup(Reply),
     Shutdown(Reply),
 }
 
@@ -237,6 +240,10 @@ impl SeatHandle {
 
     pub fn revoke_client(&self, id: ClientId) -> io::Result<()> {
         self.request(|reply| Command::RevokeClient(id, reply))
+    }
+
+    pub fn retry_cleanup(&self) -> io::Result<()> {
+        self.request(Command::RetryCleanup)
     }
 
     pub fn shutdown(mut self) -> io::Result<()> {
@@ -333,9 +340,19 @@ impl Actor {
     }
 
     fn run(mut self) -> io::Result<()> {
+        let mut next_cleanup_retry = Instant::now() + Duration::from_secs(1);
         loop {
             if let Some(shutdown) = self.process_commands()? {
                 return shutdown;
+            }
+            if self.state.needs_cleanup_retry() && Instant::now() >= next_cleanup_retry {
+                match self.state.retry_cleanup() {
+                    Ok(actions) => self.apply(actions),
+                    Err(error) => {
+                        tracing::error!(seat = %self.name, %error, "device cleanup needs retry")
+                    }
+                }
+                next_cleanup_retry = Instant::now() + Duration::from_secs(1);
             }
             if let Some(id) = self.pop_pending() {
                 self.process_client_packets(&id)?;
@@ -385,6 +402,12 @@ impl Actor {
                 PollTimeout::NONE
             } else {
                 PollTimeout::ZERO
+            };
+            let timeout = if timeout == PollTimeout::NONE && self.state.needs_cleanup_retry() {
+                PollTimeout::try_from(next_cleanup_retry.saturating_duration_since(Instant::now()))
+                    .unwrap_or(PollTimeout::MAX)
+            } else {
+                timeout
             };
             match poll(&mut poll_fds, timeout) {
                 Ok(_) | Err(nix::errno::Errno::EINTR) => {}
@@ -555,26 +578,43 @@ impl Actor {
                     let _ = reply.send(result);
                 }
                 Command::RevokeClient(id, reply) => {
+                    // Transport removal must not depend on an ioctl succeeding.
+                    self.connections.remove(&id);
+                    self.remove_pending(&id);
                     let result = self
                         .state
                         .revoke_client(&id)
-                        .map(|actions| {
-                            self.connections.remove(&id);
-                            self.remove_pending(&id);
-                            self.apply(actions);
-                        })
-                        .map_err(state_to_io);
+                        .map_err(state_to_io)
+                        .and_then(|actions| self.apply_result(actions))
+                        .and_then(|()| self.state.cleanup_status());
+                    let _ = reply.send(result);
+                }
+                Command::RetryCleanup(reply) => {
+                    let result = self
+                        .state
+                        .retry_cleanup()
+                        .map_err(state_to_io)
+                        .and_then(|actions| self.apply_result(actions));
                     let _ = reply.send(result);
                 }
                 Command::Shutdown(reply) => {
+                    let mut first_error = None;
                     for id in self.state.client_ids() {
                         self.connections.remove(&id);
-                        if let Ok(actions) = self.state.handle_eof(&id) {
-                            self.apply(actions);
+                        let result = self
+                            .state
+                            .handle_eof(&id)
+                            .map_err(state_to_io)
+                            .and_then(|actions| self.apply_result(actions));
+                        if let Err(error) = result {
+                            first_error.get_or_insert(error);
                         }
                     }
-                    let result = Ok(());
-                    let _ = reply.send(Ok(()));
+                    if let Err(error) = self.state.retry_cleanup().map_err(state_to_io) {
+                        first_error.get_or_insert(error);
+                    }
+                    let result = first_error.map_or(Ok(()), Err);
+                    let _ = reply.send(result.as_ref().map(|_| ()).map_err(copy_io_error));
                     return Ok(Some(result));
                 }
             }
@@ -631,7 +671,14 @@ impl Actor {
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
+        if let Err(error) = self.apply_result(actions) {
+            tracing::error!(seat = %self.name, %error, "resource cleanup failed; retaining retry work");
+        }
+    }
+
+    fn apply_result(&mut self, actions: Vec<Action>) -> io::Result<()> {
         let mut failed = BTreeSet::new();
+        let mut first_error = None;
         for action in actions {
             match action {
                 Action::Send { client, bytes, fd } => {
@@ -653,13 +700,18 @@ impl Actor {
                     self.events.push(SeatEvent::ClientGone {
                         seat: self.name.clone(),
                         client,
+                        cleanup_pending: self.state.has_pending_revocations(),
                     });
+                }
+                Action::CleanupFailed(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }
         for client in failed {
             self.disconnect(&client);
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn disconnect(&mut self, id: &ClientId) {
@@ -1056,6 +1108,128 @@ mod tests {
         assert_eq!(read_packet(&mut stream).0, protocol::SERVER_DEVICE_CLOSED);
         assert_eq!(*revoked.lock().unwrap(), 1);
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failed_revoke_closes_transport_reports_failure_and_retries_without_a_client() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct ControlledOps(Arc<AtomicBool>, Arc<AtomicUsize>);
+        impl DeviceOps for ControlledOps {
+            fn open(&mut self, _: &AllowedDevice) -> io::Result<OwnedFd> {
+                Ok(std::fs::File::open("/dev/null")?.into())
+            }
+            fn deactivate(&mut self, _: DeviceKind, _: &OwnedFd) -> io::Result<()> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                if self.0.load(Ordering::SeqCst) {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok(())
+                }
+            }
+            fn activate(&mut self, _: DeviceKind, _: &OwnedFd) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = ServerRuntime::initialize().unwrap();
+        let fail = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handle = runtime
+            .spawn_with_device_ops(
+                SeatConfig {
+                    name: "seat-test".into(),
+                    vt_bound: false,
+                },
+                Box::new(ControlledOps(fail.clone(), attempts.clone())),
+            )
+            .unwrap();
+        let device = AllowedDevice::canonicalized(
+            DeviceId::new("null"),
+            "/dev/null",
+            std::fs::metadata("/dev/null").unwrap().rdev(),
+            DeviceKind::Evdev,
+        )
+        .unwrap();
+        handle.add_device(device.clone()).unwrap();
+        let mut stream = client(&handle, "client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .write_all(&protocol::empty(protocol::CLIENT_OPEN_SEAT))
+            .unwrap();
+        read_packet(&mut stream);
+        read_packet(&mut stream);
+        let path = b"/dev/null\0";
+        let mut payload = (path.len() as u16).to_ne_bytes().to_vec();
+        payload.extend_from_slice(path);
+        stream
+            .write_all(&protocol::packet(protocol::CLIENT_OPEN_DEVICE, &payload).unwrap())
+            .unwrap();
+        // Receive and deliberately keep the duplicate device descriptor.
+        let mut receiver = Connection::new(stream.try_clone().unwrap().into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while receiver.received_fd_count() == 0 {
+            receiver.read().unwrap();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let held = receiver.take_received_fd().unwrap();
+        assert!(handle.revoke_client(ClientId::new("client")).is_err());
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        assert!(runtime.drain_events().iter().any(|event| matches!(
+            event,
+            SeatEvent::ClientGone {
+                cleanup_pending: true,
+                ..
+            }
+        )));
+        assert!(handle.remove_device(device.id.clone()).is_err());
+        assert!(handle.revoke_client(ClientId::new("client")).is_err());
+        let previous = attempts.load(Ordering::SeqCst);
+        fail.store(false, Ordering::SeqCst);
+        // No topology or client command should be necessary for timed retry.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while attempts.load(Ordering::SeqCst) == previous {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.revoke_client(ClientId::new("client")).unwrap();
+        handle.add_device(device).unwrap();
+        assert!(nix::fcntl::fcntl(&held, nix::fcntl::FcntlArg::F_GETFD).is_ok());
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unexpected_and_truncated_rights_disconnect_without_leaking_writers() {
+        use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+        use std::io::IoSlice;
+        for count in [1, 32] {
+            let (_runtime, handle) = actor();
+            let mut stream = client(&handle, "client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (read_end, write_end) =
+                nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC)
+                    .unwrap();
+            let rights = vec![write_end.as_raw_fd(); count];
+            let bytes = protocol::empty(protocol::CLIENT_PING);
+            sendmsg::<()>(
+                stream.as_raw_fd(),
+                &[IoSlice::new(&bytes)],
+                &[ControlMessage::ScmRights(&rights)],
+                MsgFlags::MSG_NOSIGNAL,
+                None,
+            )
+            .unwrap();
+            drop(write_end);
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            // EOF can race Connection's remaining field destructors. Join the
+            // actor before asserting that every received writer was dropped.
+            handle.shutdown().unwrap();
+            assert_eq!(nix::unistd::read(&read_end, &mut [0]).unwrap(), 0);
+        }
     }
 
     #[test]

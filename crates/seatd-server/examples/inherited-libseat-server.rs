@@ -18,10 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: inherited-libseat-server CLIENT")?;
     let runtime = ServerRuntime::initialize()?;
-    let seat = runtime.spawn_seat(SeatConfig {
-        name: "seat-test".into(),
-        vt_bound: false,
-    })?;
+    let seat = runtime.spawn_with_device_ops(
+        SeatConfig {
+            name: "seat-test".into(),
+            vt_bound: false,
+        },
+        Box::new(seatd_server::NullDeviceOps),
+    )?;
     let metadata = std::fs::metadata("/dev/null")?;
     seat.add_device(AllowedDevice::canonicalized(
         DeviceId::new("null"),

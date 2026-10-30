@@ -18,7 +18,7 @@ if (( resolved == 77 )); then
     exit 77
 fi
 (( resolved == 0 )) || { echo "invalid LIBSEAT_REPO" >&2; exit 1; }
-cargo build --manifest-path "$repo/Cargo.toml" --workspace --bins
+cargo build --manifest-path "$repo/Cargo.toml" --workspace --bins --features multiseatd/test-support
 work=$(mktemp -d /tmp/multiseat-root-e2e.XXXXXX)
 chmod 755 "$work"
 bus_pid= daemon_pid=
@@ -77,6 +77,7 @@ export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/bus"
 sudo env DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SYSTEM_BUS_ADDRESS" \
     sh -c 'echo $$ > "$1"; shift; exec "$@"' _ "$work/daemon.pid" \
     "$repo/target/debug/multiseatd" --test-only --test-seat seat-test --test-device /dev/null \
+    --lock-file "$work/daemon.lock" \
     >"$work/daemon.log" 2>&1 & daemon_wrapper=$!
 for ((i=0; i<200; i++)); do
     if [[ -f $work/daemon.pid ]]; then daemon_pid=$(<"$work/daemon.pid"); fi

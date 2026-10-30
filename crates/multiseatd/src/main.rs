@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use multiseatd::acl::LibAcl;
 use multiseatd::dbus::Bus;
+use multiseatd::instance::InstanceLock;
 use multiseatd::orchestrator::{OperationTimer, Orchestrator};
 use multiseatd::topology::Snapshot;
 use nix::poll::{PollFd, PollFlags, poll};
@@ -26,6 +27,9 @@ enum BusKind {
 struct Args {
     #[arg(long, value_enum, default_value_t = BusKind::System)]
     bus: BusKind,
+    /// Instance lock in a root-owned directory (default /run/multiseatd.lock).
+    #[arg(long)]
+    lock_file: Option<PathBuf>,
     #[arg(long, hide = true)]
     test_seat: Vec<SeatName>,
     /// Use synthetic non-VT seats only; never enumerate or change live devices.
@@ -34,6 +38,9 @@ struct Args {
     /// Explicit synthetic authorization for integration tests, never production.
     #[arg(long, hide = true, requires = "test_only")]
     test_device: Vec<PathBuf>,
+    /// Disposable direct-access ACL fixtures only; never used with live udev.
+    #[arg(long, hide = true, requires = "test_only")]
+    test_direct_node: Vec<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +54,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("multiseatd must run as root".into());
     }
+    if !args.test_device.is_empty()
+        && (!cfg!(feature = "test-support")
+            || args
+                .test_device
+                .iter()
+                .any(|path| path != std::path::Path::new("/dev/null")))
+    {
+        return Err(
+            "--test-device requires the test-support build and only accepts /dev/null".into(),
+        );
+    }
+    if args.test_only && args.lock_file.is_none() {
+        return Err("--test-only requires an explicit disposable --lock-file".into());
+    }
+    let lock_path = args
+        .lock_file
+        .as_deref()
+        .unwrap_or(std::path::Path::new("/run/multiseatd.lock"));
+    // Declared before every resource owner, so even error unwinding finishes
+    // actor/ACL cleanup before another instance can acquire the lock.
+    let _instance = InstanceLock::acquire(lock_path)?;
     let mut shutdown_mask = SigSet::empty();
     shutdown_mask.add(Signal::SIGTERM);
     shutdown_mask.add(Signal::SIGINT);
@@ -72,6 +100,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seats: args.test_seat.iter().cloned().collect(),
             ..Snapshot::default()
         };
+        snapshot.direct.insert(
+            args.test_seat[0].clone(),
+            args.test_direct_node.iter().cloned().collect(),
+        );
         for path in &args.test_device {
             let device = AllowedDevice::canonicalized(
                 DeviceId::new(path.to_string_lossy()),
@@ -88,6 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot
     };
     let mut coordinator = Orchestrator::new(runtime, LibAcl, &initial)?;
+    #[cfg(feature = "test-support")]
+    if args.test_only && !args.test_device.is_empty() {
+        for seat in &initial.seats {
+            coordinator.seed_test_actor(seat)?;
+        }
+    }
     coordinator.reconcile_topology(&initial, |_, _| {})?;
     // No D-Bus name is owned until initial ACL and brokered state are ready.
     let bus = Bus::new(matches!(args.bus, BusKind::Session))?;
@@ -163,10 +201,12 @@ fn run_loop(
             let _timer = OperationTimer::new("udev event batch");
             let mut changed = false;
             for _ in 0..64 {
-                let Some(events) = context.receive()? else {
+                let Some(_events) = context.receive()? else {
                     break;
                 };
-                changed |= !events.is_empty();
+                // Even a semantic duplicate may follow devnode recreation or
+                // a udev ACL/mode reset. Recheck direct ACLs for every batch.
+                changed = true;
             }
             if changed {
                 pending = Some(Snapshot::from_context(context, &args.test_seat)?);
@@ -199,7 +239,7 @@ fn run_loop(
         }
         if Instant::now() >= next_retry {
             if let Err(error) = coordinator.retry_access() {
-                tracing::error!(%error, "ACL convergence retry failed");
+                tracing::error!(%error, "brokered cleanup or ACL convergence retry failed");
             }
             next_retry = Instant::now() + Duration::from_secs(1);
         }

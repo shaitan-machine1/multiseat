@@ -1,6 +1,6 @@
 //! Direct-access desired state, owned only by the coordinator thread.
 //! A failed ACL write never resurrects a removed client lease.
-use crate::acl::AclOps;
+use crate::acl::{AclOps, NodeIdentity};
 use seat_udev::SeatName;
 use seatd_server::ClientId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +25,7 @@ pub struct AccessManager<A: AclOps> {
     managed: BTreeSet<PathBuf>,
     pending_clears: BTreeSet<PathBuf>,
     applied: BTreeMap<PathBuf, BTreeSet<u32>>,
+    identities: BTreeMap<PathBuf, NodeIdentity>,
 }
 
 impl<A: AclOps> AccessManager<A> {
@@ -39,6 +40,7 @@ impl<A: AclOps> AccessManager<A> {
             managed: BTreeSet::new(),
             pending_clears: BTreeSet::new(),
             applied: BTreeMap::new(),
+            identities: BTreeMap::new(),
         };
         manager.set_nodes(nodes)?;
         Ok(manager)
@@ -163,6 +165,7 @@ impl<A: AclOps> AccessManager<A> {
         for path in forgotten {
             self.managed.remove(&path);
             self.applied.remove(&path);
+            self.identities.remove(&path);
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -176,24 +179,34 @@ impl<A: AclOps> AccessManager<A> {
     }
 
     fn apply(&mut self, path: &PathBuf, users: &BTreeSet<u32>) -> io::Result<()> {
-        if self.applied.get(path) == Some(users) {
-            return Ok(());
-        }
-        match self.acl.set_users(path, users) {
-            Ok(()) => {
+        // A pathname/UID success cache cannot prove the current inode or ACL
+        // is unchanged. Revalidate on topology events AND periodic retries.
+        // Keep the last successful UID set only for the failed-clear barrier.
+        let clearing_old = self.pending_clears.contains(path) || !self.nodes.contains_key(path);
+        let expected = clearing_old
+            .then(|| self.identities.get(path).copied())
+            .flatten();
+        match self.acl.apply_users(path, users, expected) {
+            Ok(identity) => {
+                if let Some(identity) = identity {
+                    self.identities.insert(path.clone(), identity);
+                } else {
+                    self.identities.remove(path);
+                }
                 self.applied.insert(path.clone(), users.clone());
                 Ok(())
             }
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound && !self.nodes.contains_key(path) =>
-            {
-                // A removed node which no longer exists has no remaining ACL.
-                self.applied.insert(path.clone(), BTreeSet::new());
-                Ok(())
-            }
-            Err(error) => {
-                // A backend failure may have changed the ACL. Never let the
-                // success cache suppress a compensating write or later retry.
+            Err(failure) => {
+                // A backend failure may have changed the pinned inode's ACL.
+                // Retain its identity even though successful UID state is lost.
+                if let Some(identity) = failure.identity {
+                    self.identities.insert(path.clone(), identity);
+                }
+                let error = failure.error;
+                if error.kind() == io::ErrorKind::NotFound && !self.nodes.contains_key(path) {
+                    self.applied.insert(path.clone(), BTreeSet::new());
+                    return Ok(());
+                }
                 self.applied.remove(path);
                 tracing::error!(path = %path.display(), %error, "direct-access ACL convergence failed");
                 Err(error)
@@ -261,6 +274,88 @@ mod tests {
     }
     fn users(acl: &FakeAcl, path: &str) -> BTreeSet<u32> {
         acl.0.borrow().applied[Path::new(path)].clone()
+    }
+
+    #[test]
+    fn same_path_replacement_and_external_acl_reset_are_repaired() {
+        use crate::acl::LibAcl;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node");
+        std::fs::write(&path, b"").unwrap();
+        let inventory = BTreeMap::from([(seat("seat1"), BTreeSet::from([path.clone()]))]);
+        let mut access = AccessManager::new(LibAcl, inventory.clone()).unwrap();
+        access
+            .acquire(client("lease"), seat("seat1"), 424242)
+            .unwrap();
+        let first = access.identities[&path];
+        // Simulate a remove/add batch whose final pathname inventory is equal.
+        std::fs::rename(&path, directory.path().join("old")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        access.set_nodes(inventory).unwrap();
+        assert_ne!(access.identities[&path], first);
+        assert!(crate::acl::test_acl_text(&path).contains("user:424242:rw-"));
+        LibAcl.set_users(&path, &BTreeSet::new()).unwrap();
+        access.reconcile().unwrap();
+        assert!(crate::acl::test_acl_text(&path).contains("user:424242:rw-"));
+        access.revoke(&client("lease")).unwrap();
+        assert!(!crate::acl::test_acl_text(&path).contains("user:424242:"));
+    }
+
+    #[test]
+    fn failed_write_to_replacement_retains_its_identity_for_cleanup() {
+        use crate::acl::{ApplyFailure, LibAcl};
+        #[derive(Clone)]
+        struct UncertainAcl(Rc<RefCell<bool>>);
+        impl AclOps for UncertainAcl {
+            fn set_users(&self, path: &Path, users: &BTreeSet<u32>) -> io::Result<()> {
+                self.apply_users(path, users, None)
+                    .map(|_| ())
+                    .map_err(|failure| failure.error)
+            }
+            fn apply_users(
+                &self,
+                path: &Path,
+                users: &BTreeSet<u32>,
+                expected: Option<NodeIdentity>,
+            ) -> Result<Option<NodeIdentity>, ApplyFailure> {
+                let identity = LibAcl.apply_users(path, users, expected)?;
+                if *self.0.borrow() {
+                    Err(ApplyFailure {
+                        identity,
+                        error: io::Error::other("uncertain write"),
+                    })
+                } else {
+                    Ok(identity)
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node");
+        std::fs::write(&path, b"").unwrap();
+        let fail = Rc::new(RefCell::new(false));
+        let mut access = AccessManager::new(
+            UncertainAcl(fail.clone()),
+            BTreeMap::from([(seat("seat1"), BTreeSet::from([path.clone()]))]),
+        )
+        .unwrap();
+        access
+            .acquire(client("original"), seat("seat1"), 424242)
+            .unwrap();
+        let old = access.identities[&path];
+        std::fs::rename(&path, directory.path().join("old")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        *fail.borrow_mut() = true;
+        assert!(
+            access
+                .acquire(client("rejected"), seat("seat1"), 424243)
+                .is_err()
+        );
+        assert_ne!(access.identities[&path], old);
+        assert!(crate::acl::test_acl_text(&path).contains("user:424242:rw-"));
+        *fail.borrow_mut() = false;
+        access.set_nodes(BTreeMap::new()).unwrap();
+        assert!(!crate::acl::test_acl_text(&path).contains("user:424242:"));
+        assert!(!access.leases.contains_key(&client("rejected")));
     }
 
     #[test]

@@ -89,6 +89,6 @@ EOF
 cc "$work/client.c" -I"$libseat_repo/include" -L"$work/libseat-build" \
     -Wl,-rpath,"$work/libseat-build" -lseat -o "$work/client"
 cargo build --manifest-path "$repo/Cargo.toml" \
-    -p seatd-server --example inherited-libseat-server
+    -p seatd-server --features test-support --example inherited-libseat-server
 sudo "$repo/target/debug/examples/inherited-libseat-server" "$work/client"
 echo "Rust seatd-server/patched libseat close-reopen compatibility test passed"

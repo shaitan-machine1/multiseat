@@ -6,7 +6,7 @@ Linux seat topology, embedded seatd actors and direct-access UID leases.
   synchronous coordinator thread and one seatd actor thread per discovered seat.
 - `seatd-server` implements the corrected seatd server protocol, VT arbitration,
   dynamic device authorization and injected socketpair clients. The existing
-  sibling `seatd` fork remains the C libseat source and behavioral reference.
+  `seatd` fork remains the C libseat source and behavioral reference.
 - `seat-udev` owns topology, classification, static direct-access discovery and
   persistent assignments. Its source revision and license are preserved in
   `crates/seat-udev/SOURCE.md`; the standalone repository is unchanged. Seat
@@ -33,6 +33,12 @@ Actors prioritize commands over bounded client-message batches. Seat0 alone is
 VT-bound; its actor owns VT ioctls, signalfd and the delayed-release timer.
 Operations exceeding 100 ms produce warnings, not hard latency guarantees.
 
+Before enumerating devices, changing ACLs or creating actors, the daemon takes
+an exclusive lock on `/run/multiseatd.lock`. It holds that lock through final
+cleanup and never unlinks the lock inode. `--lock-file PATH` selects an explicit
+alternative in a root-owned directory; instances managing the same resources
+must use the same lock. D-Bus publication still waits for ready initial state.
+
 ```text
 brokered: DRM / evdev / hidraw -> seatd-server only
 uaccess minus brokered        -> direct-access UID ACLs only
@@ -42,6 +48,14 @@ Device movement and reclassification remove old brokered authorization and
 old direct-access ACLs before adding either resource on the destination.
 Removed protocol device IDs remain closeable; remove/re-add creates a new
 kernel file description. Hidraw fails closed without revocation support.
+Failed revocation ioctls retain the server device FD independently of client
+membership. Actors retry cleanup on a one-second deadline without an extra
+thread. The transport and UID lease still end immediately; explicit revoke
+reports failure until cleanup completes. No successor activation or destination
+authorization may bypass pending revocation. Even after the two-second client
+disable deadline, a failed device ioctl prevents kernel VT release until retry
+succeeds. Process shutdown remains best effort if the kernel keeps rejecting
+revocation.
 See `crates/seatd-server/BEHAVIOR.md` for test mapping and kernel limitations.
 
 The ACL backend is adapted from aclad revision
@@ -51,7 +65,13 @@ named users with the desired set and recalculates the mask. Startup clears
 stale named-user entries on known direct nodes before publishing seats.
 Multiple client leases for the same `(seat, uid)` are reference-counted.
 Failed convergence is retained for retry; failed revocation never resurrects
-a client lease.
+a client lease. ACL operations pin an inode with `O_PATH` and use its procfs
+FD path, avoiding device-I/O opens and pathname replacement races during the
+write. Old-node cleanup checks the recorded identity and skips unrelated
+replacement inodes. Topology batches and periodic retries revalidate actual
+ACL state, even when the pathname and desired UIDs are unchanged. Current
+udev tags, not historical sticky tags, determine access and seat lifetime;
+older libudev implementations retain an explicit compatibility path.
 
 Client IDs are canonical UUIDv7 strings, opaque and valid for one daemon
 lifetime, not authentication tokens. Final endpoint EOF removes the lease.
@@ -120,12 +140,20 @@ an existing local checkout instead.
 The first harness covers real libseat open/device/close and sequential reopen
 through a retained duplicate. The private-bus harness verifies independent
 root authentication, restricted signals, FD and duplicate lifetime, explicit
-revocation, name ownership, bus-loss cleanup and the two-thread count for one
-synthetic seat. The end-to-end harness uses the real daemon and seat-launch,
+revocation, singleton exclusion without changing a live temporary ACL grant,
+name ownership, bus-loss cleanup and the two-thread count for one synthetic
+seat. The end-to-end harness uses the real daemon and seat-launch,
 runs patched libseat as nobody and tests exec-failure cleanup.
 
-Hidden `--test-only --test-seat seat-test` ignores live topology and creates
-only synthetic non-VT seats. Hidden `--test-device` authorizes an explicitly
-selected character node for protocol tests; it must not be used as production
-policy. Real VT, DRM, evdev and hidraw hardware validation is deferred to the
+Hidden `--test-only --test-seat seat-test --lock-file /TEMP/DIR/daemon.lock`
+ignores live topology and creates only synthetic non-VT seats; an explicit
+disposable lock path is mandatory. Hidden `--test-device` requires the
+`multiseatd/test-support` build feature and accepts only `/dev/null` as a
+synthetic evdev stand-in. Its explicit test backend validates the open but
+performs no device revocation ioctl. `--test-direct-node` selects a disposable
+ACL fixture. Neither test hook is production policy; the harnesses never treat
+`/dev/null`'s `ENOTTY` as evidence that a real device was revoked.
+The unit suites also exercise failed-ioctl retention and retry, truncated
+ancillary FD cleanup, real libudev tag parsing, same-path inode replacement and
+externally reset ACLs. Real VT, DRM, evdev and hidraw hardware validation is deferred to the
 separate deployment phase.

@@ -3,7 +3,7 @@
 set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if (( EUID != 0 )); then
-    for tool in cargo sudo dbus-daemon timeout; do
+    for tool in cargo sudo dbus-daemon timeout getfacl; do
         command -v "$tool" >/dev/null || exit 77
     done
     sudo -n true || exit 77
@@ -33,7 +33,8 @@ wait_file() {
     echo "timed out waiting for $1" >&2; return 1
 }
 start_daemon() {
-    "$daemon_program" --test-only --test-seat seat-test >"$work/daemon.log" 2>&1 &
+    "$daemon_program" --test-only --test-seat seat-test --lock-file "$work/daemon.lock" \
+        --test-direct-node "$work/direct-node" >"$work/daemon.log" 2>&1 &
     daemon=$!; pids+=("$daemon")
     for ((i=0; i<200; i++)); do
         if "$probe" ready 2>/dev/null; then return; fi
@@ -42,6 +43,7 @@ start_daemon() {
     done
     return 1
 }
+touch "$work/direct-node"
 for policy in permissive production; do
     include=""
     if [[ $policy == production ]]; then include="<include>$repo/dist/dbus/org.decoupling.multiseatd1.conf</include>"; fi
@@ -62,11 +64,18 @@ EOF
     [[ $(find "/proc/$daemon/task" -mindepth 1 -maxdepth 1 -type d | wc -l) == 2 ]]
     timeout 15 "$probe" contract
     timeout 15 sudo -u nobody env DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SYSTEM_BUS_ADDRESS" "$probe" deny
-    # The name cannot be replaced by a second daemon.
-    if "$daemon_program" --test-only --test-seat seat-test >"$work/second.log" 2>&1; then exit 1; fi
     "$probe" hold "$work/hold" & holder=$!; pids+=("$holder")
     wait_file "$work/hold"
+    before=$(getfacl -cpn "$work/direct-node")
+    grep -q '^user:1000:rw-' <<<"$before"
+    # A competing process must fail BEFORE touching ACLs or starting actors.
+    if "$daemon_program" --test-only --test-seat seat-test --lock-file "$work/daemon.lock" \
+        --test-direct-node "$work/direct-node" >"$work/second.log" 2>&1; then exit 1; fi
+    grep -q 'instance lock' "$work/second.log"
+    [[ $(getfacl -cpn "$work/direct-node") == "$before" ]]
+    [[ $(find "/proc/$daemon/task" -mindepth 1 -maxdepth 1 -type d | wc -l) == 2 ]]
     kill -TERM "$daemon"; wait "$daemon"; wait "$holder"
+    if getfacl -cpn "$work/direct-node" | grep -q '^user:1000:'; then exit 1; fi
     rm "$work/hold"
     # Real D-Bus policy restricts broadcast delivery, not only method calls.
     "$probe" watch "$work/root-watch" yes & root_watch=$!; pids+=("$root_watch")

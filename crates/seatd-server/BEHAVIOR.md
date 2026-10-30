@@ -93,6 +93,40 @@ remains usable. `actor::tests::actor_panic_deactivates_open_devices_and_reports_
 covers that path and the resulting `ActorFailed` event; the coordinator treats
 it as critical, rejects new work, tears down clients and exits.
 
+## Failure-path safety regressions
+
+Client EOF, explicit revoke, protocol seat close and final device close never
+forget a device whose revocation ioctl failed. Its server FD moves into retired
+cleanup storage, independent of membership and the external UID lease. Normal
+disable failures remain retryable too. Device commands and a one-second actor
+deadline retry cleanup without a worker thread or command polling sleeps.
+`CleanupFailed` actions report errors without discarding client-gone events;
+explicit revocation closes the transport even when it returns an error.
+Pending cleanup blocks successor activation and new authorization. Device-command
+completion also resumes arbitration after the last failed ioctl succeeds.
+
+The two-second VT deadline forces the client disabled, but never overrides a
+failed device revocation. Kernel release and departing-terminal restoration
+wait for successful device cleanup; a disconnect cannot implicitly release the
+VT early through `VT_AUTO` restoration. Final process teardown remains best
+effort and cannot promise revocation if a driver persistently refuses it.
+
+Coverage:
+
+- `state::tests::teardown_keeps_failed_opens_without_resurrecting_membership`
+- `state::tests::close_device_failure_is_retained_and_other_devices_are_attempted`
+- `state::tests::failed_disable_blocks_successor_until_retry_succeeds`
+- `state::tests::failed_device_revoke_blocks_kernel_release_even_after_ack_timeout_or_eof`
+- `actor::tests::failed_revoke_closes_transport_reports_failure_and_retries_without_a_client`
+- `multiseatd::orchestrator::tests::failed_cleanup_blocks_moves_but_not_lease_or_acl_removal`
+
+Ancillary receive ownership is established before rejecting `MSG_CTRUNC`.
+`connection::tests::truncated_ancillary_data_closes_every_installed_descriptor`
+and `actor::tests::unexpected_and_truncated_rights_disconnect_without_leaking_writers`
+use pipe-writer EOF to detect leaks, independently of parallel tests' FD counts.
+The Linux kernel closes excess rights that do not fit; the receiver closes all
+rights that were installed into its ancillary buffer.
+
 Kernel limits remain those of the C server: DRM revocation drops master, not
 all possible operations on the FD; evdev/hidraw revocation is permanent for that
 open file description. The tests use fake device operations; real driver ioctl

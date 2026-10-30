@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Explicit synthetic device injection for cross-crate regression tests only.
+test-support = []
+
 [dependencies]
 libc.workspace = true
 nix.workspace = true
@@ -14,3 +18,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "inherited-libseat-server"
+required-features = ["test-support"]

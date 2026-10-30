@@ -1,8 +1,8 @@
 use crate::protocol::{DecodeError, Decoder, MAX_BUFFER_LEN, Packet};
 use nix::errno::Errno;
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use std::collections::VecDeque;
-use std::io::{self, IoSlice, IoSliceMut};
+use std::io::{self, IoSlice};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 const READ_SIZE: usize = 4096;
@@ -84,36 +84,14 @@ impl Connection {
                 "seatd input buffer is full",
             ));
         }
-        let mut iov = [IoSliceMut::new(&mut bytes[..capacity.min(READ_SIZE)])];
-        let mut cmsg = nix::cmsg_space!([i32; MAX_RECEIVED_FDS]);
-        let message = match recvmsg::<()>(
-            self.fd.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg),
-            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
-        ) {
+        let (count, received) = match receive_owned(&self.fd, &mut bytes[..capacity.min(READ_SIZE)])
+        {
             Ok(message) => message,
-            Err(Errno::EAGAIN) => return Ok(ReadStatus::WouldBlock),
-            Err(error) => return Err(errno_to_io(error)),
-        };
-        let count = message.bytes;
-        let flags = message.flags;
-        let mut received = Vec::new();
-        for item in message.cmsgs().map_err(errno_to_io)? {
-            if let ControlMessageOwned::ScmRights(fds) = item {
-                for fd in fds {
-                    // SAFETY: SCM_RIGHTS installed a new descriptor owned by
-                    // this process and MSG_CMSG_CLOEXEC marked it close-on-exec.
-                    received.push(unsafe { OwnedFd::from_raw_fd(fd) });
-                }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(ReadStatus::WouldBlock);
             }
-        }
-        if flags.contains(MsgFlags::MSG_CTRUNC) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated seatd ancillary data",
-            ));
-        }
+            Err(error) => return Err(error),
+        };
         self.received_fds.extend(received);
         if count == 0 {
             self.eof = true;
@@ -194,6 +172,69 @@ impl Connection {
         }
         Ok(true)
     }
+}
+
+/// Unlike nix's cmsgs(), this owns installed SCM_RIGHTS descriptors even when
+/// MSG_CTRUNC is set. Linux closes the excess descriptors that did not fit; we
+/// must close those that DID fit before rejecting the message.
+fn receive_owned(fd: &OwnedFd, bytes: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    // cmsghdr alignment is required by CMSG_FIRSTHDR/NXTHDR.
+    let mut control = [0usize;
+        (size_of::<libc::cmsghdr>() + MAX_RECEIVED_FDS * size_of::<i32>())
+            .div_ceil(size_of::<usize>())];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: all remaining msghdr fields are nullable/zero-length outputs.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = size_of_val(&control);
+    // SAFETY: iov and control describe live writable buffers for this call.
+    let count = unsafe {
+        libc::recvmsg(
+            fd.as_raw_fd(),
+            &mut message,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut received = Vec::new();
+    // SAFETY: recvmsg produced the kernel-validated ancillary headers. We still
+    // bound each header and payload to the returned buffer before reading it.
+    unsafe {
+        let end = (message.msg_control as usize) + message.msg_controllen;
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            let start = header as usize;
+            if start + size_of::<libc::cmsghdr>() > end {
+                break;
+            }
+            let length = (*header).cmsg_len;
+            let minimum = libc::CMSG_LEN(0) as usize;
+            if length < minimum || length > end - start {
+                break;
+            }
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(header).cast::<i32>();
+                for index in 0..(length - minimum) / size_of::<i32>() {
+                    received.push(OwnedFd::from_raw_fd(data.add(index).read_unaligned()));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    if message.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated seatd ancillary data",
+        ));
+    }
+    Ok((count as usize, received))
 }
 
 fn errno_to_io(error: Errno) -> io::Error {
@@ -342,6 +383,33 @@ mod tests {
             unsafe { libc::read(read_end.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
             0
         );
+    }
+
+    #[test]
+    fn truncated_ancillary_data_closes_every_installed_descriptor() {
+        let (mut connection, peer) = pair();
+        let (read_end, write_end) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK)
+                .unwrap();
+        let bytes = protocol::empty(protocol::CLIENT_PING);
+        let rights = vec![write_end.as_raw_fd(); MAX_RECEIVED_FDS * 2];
+        sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(&bytes)],
+            &[ControlMessage::ScmRights(&rights)],
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        )
+        .unwrap();
+        drop(write_end);
+        assert_eq!(
+            connection.read().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(connection);
+        drop(peer);
+        // Any leaked copy of the pipe writer would yield EAGAIN instead of EOF.
+        assert_eq!(nix::unistd::read(&read_end, &mut [0]).unwrap(), 0);
     }
 
     #[test]

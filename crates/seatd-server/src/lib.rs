@@ -13,6 +13,9 @@ mod vt;
 
 pub use actor::{SeatConfig, SeatEvent, SeatHandle, ServerRuntime};
 pub use connection::{Connection, ReadStatus};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use device::NullDeviceOps;
 pub use device::{AllowedDevice, DeviceId, DeviceKind, DeviceOps, KernelDeviceOps};
 pub use state::{Action, ClientId, ClientState, SeatState, StateError};
 pub use vt::{LinuxVtOps, VtOps};

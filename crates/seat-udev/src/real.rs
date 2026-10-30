@@ -5,7 +5,9 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use udev::{Device, DeviceType, Enumerator, EventType, MonitorBuilder, MonitorSocket};
+use udev::{
+    AsRawWithContext, Device, DeviceType, Enumerator, EventType, MonitorBuilder, MonitorSocket,
+};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -216,6 +218,11 @@ fn semantic_device(device: &Device) -> Result<SeatDevice, Error> {
     if !device.is_initialized() {
         return Err(Error::NotInitialized(syspath));
     }
+    semantic_initialized_device(device)
+}
+
+fn semantic_initialized_device(device: &Device) -> Result<SeatDevice, Error> {
+    let syspath = device.syspath().to_path_buf();
     let seat = match device.property_value("ID_SEAT") {
         Some(value) if !value.is_empty() => SeatName::parse(value.to_string_lossy().into_owned())?,
         _ => SeatName::seat0(),
@@ -248,19 +255,141 @@ fn relevant(device: &SeatDevice) -> bool {
     device.brokerable() || device.uaccess || device.master_of_seat
 }
 
-fn has_tag(device: &Device, wanted: &str) -> bool {
-    ["CURRENT_TAGS", "TAGS"].into_iter().any(|property| {
-        device
-            .property_value(property)
-            .map(|tags| tags.to_string_lossy().split(':').any(|tag| tag == wanted))
-            .unwrap_or(false)
+type HasCurrentTag = unsafe extern "C" fn(*mut libc::c_void, *const libc::c_char) -> libc::c_int;
+
+fn current_tag_api() -> Option<HasCurrentTag> {
+    static API: std::sync::OnceLock<Option<HasCurrentTag>> = std::sync::OnceLock::new();
+    *API.get_or_init(|| {
+        // Older libudev/eudev lacks this symbol and uses non-sticky TAGS.
+        // Resolve optionally rather than imposing a new minimum libudev ABI.
+        // SAFETY: the symbol's signature is defined by libudev; the library
+        // is linked for the lifetime of this process.
+        let symbol =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"udev_device_has_current_tag".as_ptr()) };
+        (!symbol.is_null())
+            .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, HasCurrentTag>(symbol) })
     })
+}
+
+fn has_tag(device: &Device, wanted: &str) -> bool {
+    has_tag_with_api(device, wanted, current_tag_api())
+}
+
+fn has_tag_with_api(device: &Device, wanted: &str, api: Option<HasCurrentTag>) -> bool {
+    if let Some(api) = api {
+        let tag = std::ffi::CString::new(wanted).expect("internal tag has no NUL");
+        // SAFETY: the device and tag are live for the duration of this call.
+        return unsafe { api(device.as_raw().cast(), tag.as_ptr()) > 0 };
+    }
+    // Prefer CURRENT_TAGS even in compatibility implementations which expose
+    // the property but not the API. An explicitly empty property is decisive.
+    device
+        .property_value("CURRENT_TAGS")
+        .or_else(|| device.property_value("TAGS"))
+        .is_some_and(|tags| tags.to_string_lossy().split(':').any(|tag| tag == wanted))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn current_tags_semantic_boundary() {
+        // Construct actual libudev event objects from a child-only environment:
+        // no global environment mutation, udev injection, or live-node writes.
+        if let Ok(mode) = std::env::var("SEAT_UDEV_TAG_FIXTURE") {
+            use udev::{AsRaw, FromRawWithContext};
+            unsafe extern "C" {
+                fn udev_device_new_from_environment(
+                    context: *mut libc::c_void,
+                ) -> *mut libc::c_void;
+            }
+            let context = udev::Udev::new().unwrap().into_raw();
+            // SAFETY: context is live; the returned device and context are
+            // transferred together into the matching udev ownership wrapper.
+            let raw = unsafe { udev_device_new_from_environment(context.cast()) };
+            assert!(!raw.is_null());
+            let device = unsafe { Device::from_raw_with_context(context, raw.cast()) };
+            if mode == "legacy" {
+                assert!(has_tag_with_api(&device, "uaccess", None));
+                assert!(has_tag_with_api(&device, "master-of-seat", None));
+                return;
+            }
+            // Compatibility implementations exposing CURRENT_TAGS must prefer
+            // it. Modern libudev drops empty properties, so empty/absent current
+            // tags require its API, not a property-presence heuristic.
+            if device.property_value("CURRENT_TAGS").is_some() {
+                assert!(!has_tag_with_api(&device, "uaccess", None));
+                assert!(!has_tag_with_api(&device, "master-of-seat", None));
+            }
+            if current_tag_api().is_none() {
+                return;
+            }
+            // Synthetic event objects have no initialized database entry. Test
+            // the exact parser used after the separate readiness check.
+            let parsed = semantic_initialized_device(&device).unwrap();
+            assert!(!parsed.uaccess);
+            assert!(!parsed.master_of_seat);
+            let mut model = Model::default();
+            let mut old = parsed.clone();
+            old.uaccess = true;
+            old.master_of_seat = true;
+            model.seed(old);
+            // Production receive removes devices that cease being relevant.
+            let events = if relevant(&parsed) {
+                model.add_or_change(parsed.clone())
+            } else {
+                model.remove(&parsed.syspath)
+            };
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::SeatRemoved(_)))
+            );
+            assert!(model.direct_access_devices(&parsed.seat).is_empty());
+            return;
+        }
+        for mode in ["removed", "empty", "absent", "legacy"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "real::tests::current_tags_semantic_boundary",
+                    "--nocapture",
+                ])
+                .env("SEAT_UDEV_TAG_FIXTURE", mode)
+                .env("ACTION", "change")
+                .env("DEVPATH", "/devices/virtual/mem/null")
+                .env("SUBSYSTEM", "mem")
+                .env("DEVNAME", "/dev/null")
+                .env("MAJOR", "1")
+                .env("MINOR", "3")
+                .env("SEQNUM", "1")
+                .env("USEC_INITIALIZED", "1")
+                .env("ID_SEAT", "seat-test")
+                .env("TAGS", ":uaccess:master-of-seat:");
+            command.env_remove("CURRENT_TAGS");
+            if mode == "legacy" {
+                command.env_remove("UDEV_DATABASE_VERSION");
+            } else {
+                command.env("UDEV_DATABASE_VERSION", "1");
+                if mode == "removed" {
+                    command.env("CURRENT_TAGS", ":other:");
+                }
+                if mode == "empty" {
+                    command.env("CURRENT_TAGS", "");
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn static_nodes_are_sorted_deduplicated_and_exclude_brokered_devices() {

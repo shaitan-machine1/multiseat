@@ -51,6 +51,9 @@ pub enum Action {
         state: ClientState,
     },
     ClientGone(ClientId),
+    /// Membership/lease removal is irreversible even if resource cleanup fails.
+    /// Actors must publish the other actions AND report this error to callers.
+    CleanupFailed(io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +88,7 @@ struct OpenDevice {
     references: usize,
     active: bool,
     revoked: bool,
+    pending_deactivation: bool,
 }
 
 struct Client {
@@ -109,6 +113,8 @@ pub struct SeatState<D: DeviceOps> {
     vt: Option<Box<dyn VtOps>>,
     current_vt: i32,
     vt_release_pending: bool,
+    pending_cleanup: Vec<OpenDevice>,
+    closing_vts: BTreeSet<i32>,
 }
 
 impl<D: DeviceOps> SeatState<D> {
@@ -133,6 +139,8 @@ impl<D: DeviceOps> SeatState<D> {
             vt,
             current_vt: -1,
             vt_release_pending: false,
+            pending_cleanup: Vec::new(),
+            closing_vts: BTreeSet::new(),
         }
     }
 
@@ -292,6 +300,9 @@ impl<D: DeviceOps> SeatState<D> {
                 revoked.insert((device.authorization_id.clone(), device.generation));
             }
         }
+        for device in &self.pending_cleanup {
+            revoked.insert((device.authorization_id.clone(), device.generation));
+        }
         let mut first_error = None;
         for (id, generation) in revoked {
             if let Err(error) = self.revoke_authorization(&id, generation) {
@@ -302,6 +313,7 @@ impl<D: DeviceOps> SeatState<D> {
             return Err(StateError::Device(error));
         }
 
+        self.cleanup_status().map_err(StateError::Device)?;
         let mut next = BTreeMap::new();
         for (id, device) in replacements {
             let generation = self
@@ -313,7 +325,7 @@ impl<D: DeviceOps> SeatState<D> {
             next.insert(id, AuthorizedDevice { device, generation });
         }
         self.allowed = next;
-        Ok(Vec::new())
+        self.retry_cleanup()
     }
 
     /// Deny new opens immediately and retry any failed revocation for this ID.
@@ -330,6 +342,12 @@ impl<D: DeviceOps> SeatState<D> {
                     .filter(|device| device.authorization_id == *id)
                     .map(|device| device.generation)
             })
+            .chain(
+                self.pending_cleanup
+                    .iter()
+                    .filter(|device| device.authorization_id == *id)
+                    .map(|device| device.generation),
+            )
             .collect::<BTreeSet<_>>();
         let mut first_error = None;
         for generation in generations {
@@ -337,7 +355,10 @@ impl<D: DeviceOps> SeatState<D> {
                 first_error.get_or_insert(error);
             }
         }
-        first_error.map_or_else(|| Ok(Vec::new()), |error| Err(StateError::Device(error)))
+        if let Some(error) = first_error {
+            return Err(StateError::Device(error));
+        }
+        self.retry_cleanup()
     }
 
     pub fn revoke_client(&mut self, id: &ClientId) -> Result<Vec<Action>, StateError> {
@@ -443,7 +464,7 @@ impl<D: DeviceOps> SeatState<D> {
             client: id.clone(),
             state: ClientState::Waiting,
         });
-        if self.active.is_none() && !self.vt_release_pending {
+        if self.active.is_none() && !self.vt_release_pending && !self.has_pending_revocations() {
             actions.extend(self.activate_client(id));
         }
         Ok(actions)
@@ -506,15 +527,7 @@ impl<D: DeviceOps> SeatState<D> {
             .get_mut(id)
             .ok_or_else(|| StateError::UnknownClient(id.clone()))?;
         let session = client.session;
-        for device in client.devices.values_mut() {
-            if device.active {
-                if let Err(error) = self.device_ops.deactivate(device.kind, &device.fd) {
-                    tracing::warn!(client = %id, device = device.protocol_id, %error, "could not deactivate device while closing seat");
-                }
-                device.active = false;
-            }
-        }
-        client.devices.clear();
+        let devices = std::mem::take(&mut client.devices);
         client.session = None;
         client.state = ClientState::Connected;
         if was_active {
@@ -522,24 +535,31 @@ impl<D: DeviceOps> SeatState<D> {
         }
 
         let mut actions = Vec::new();
-        if was_active {
-            if self.vt_release_pending {
-                self.finish_vt_release()?;
-            } else {
-                actions.extend(self.activate_next());
+        for (_, device) in devices {
+            if let Err(error) = self.retire_device(device) {
+                actions.push(Action::CleanupFailed(error));
             }
         }
-        if let (Some(vt), Some(session)) = (self.vt.as_mut(), session)
-            && (!was_active || self.active.is_none())
-            && let Err(error) = vt.close(session)
+        if self.vt.is_some()
+            && let Some(session) = session
         {
-            tracing::warn!(session, %error, "could not restore departing client's VT");
+            self.closing_vts.insert(session);
+        }
+        if was_active && self.vt_release_pending {
+            if let Err(error) = self.finish_vt_release() {
+                // Do not lose client-gone events or deferred terminal cleanup.
+                actions.push(Action::CleanupFailed(io::Error::other(error)));
+            }
+        }
+        self.close_retired_vts();
+        if was_active {
+            actions.extend(self.activate_next());
         }
         Ok(actions)
     }
 
     fn open_device(&mut self, id: &ClientId, requested: &Path) -> Vec<Action> {
-        if self.clients[id].state != ClientState::Active {
+        if self.clients[id].state != ClientState::Active || self.has_pending_revocations() {
             return vec![send_error(id, libc::EPERM)];
         }
         let canonical = match fs::canonicalize(requested) {
@@ -603,6 +623,7 @@ impl<D: DeviceOps> SeatState<D> {
                 references: 1,
                 active: true,
                 revoked: false,
+                pending_deactivation: false,
             },
         );
         vec![send(id, protocol::device_opened(protocol_id), Some(sent))]
@@ -630,8 +651,11 @@ impl<D: DeviceOps> SeatState<D> {
                 .devices
                 .remove(&protocol_id)
                 .unwrap();
-            if device.active {
-                let _ = self.device_ops.deactivate(device.kind, &device.fd);
+            if let Err(error) = self.retire_device(device) {
+                return vec![
+                    send_error(id, error.raw_os_error().unwrap_or(libc::EIO)),
+                    Action::CleanupFailed(error),
+                ];
             }
         }
         vec![send(
@@ -706,7 +730,8 @@ impl<D: DeviceOps> SeatState<D> {
                 match self.device_ops.deactivate(device.kind, &device.fd) {
                     Ok(()) => device.active = false,
                     Err(error) => {
-                        tracing::warn!(client = %id, device = device.protocol_id, %error, "could not deactivate device");
+                        device.pending_deactivation = true;
+                        tracing::warn!(client = %id, device = device.protocol_id, %error, "could not deactivate device; retaining retry work");
                     }
                 }
             }
@@ -749,7 +774,7 @@ impl<D: DeviceOps> SeatState<D> {
     }
 
     fn activate_next(&mut self) -> Vec<Action> {
-        if self.active.is_some() || self.vt_release_pending {
+        if self.active.is_some() || self.vt_release_pending || self.has_pending_revocations() {
             return Vec::new();
         }
         let candidate = if self.vt.is_some() {
@@ -777,6 +802,9 @@ impl<D: DeviceOps> SeatState<D> {
     }
 
     fn activate_client(&mut self, id: &ClientId) -> Vec<Action> {
+        if self.has_pending_revocations() {
+            return Vec::new();
+        }
         let session = self.clients[id]
             .session
             .expect("only seat members can be activated");
@@ -818,7 +846,7 @@ impl<D: DeviceOps> SeatState<D> {
     }
 
     fn finish_vt_release(&mut self) -> Result<(), StateError> {
-        if !self.vt_release_pending {
+        if !self.vt_release_pending || self.has_pending_revocations() {
             return Ok(());
         }
         self.vt_release_pending = false;
@@ -843,8 +871,12 @@ impl<D: DeviceOps> SeatState<D> {
                 device.revoked = true;
                 if device.active {
                     match self.device_ops.deactivate(device.kind, &device.fd) {
-                        Ok(()) => device.active = false,
+                        Ok(()) => {
+                            device.active = false;
+                            device.pending_deactivation = false;
+                        }
                         Err(error) => {
+                            device.pending_deactivation = true;
                             tracing::error!(client = %client_id, device = %id, %error, "could not revoke removed device");
                             first_error.get_or_insert(error);
                         }
@@ -852,16 +884,115 @@ impl<D: DeviceOps> SeatState<D> {
                 }
             }
         }
+        self.pending_cleanup.retain_mut(|device| {
+            if device.authorization_id != *id || device.generation != generation {
+                return true;
+            }
+            match self.device_ops.deactivate(device.kind, &device.fd) {
+                Ok(()) => false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    true
+                }
+            }
+        });
         first_error.map_or(Ok(()), Err)
     }
 
-    fn has_pending_revocations(&self) -> bool {
-        self.clients.values().any(|client| {
-            client
+    fn retire_device(&mut self, mut device: OpenDevice) -> io::Result<()> {
+        if device.active
+            && let Err(error) = self.device_ops.deactivate(device.kind, &device.fd)
+        {
+            device.revoked = true;
+            device.pending_deactivation = true;
+            self.pending_cleanup.push(device);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn has_pending_revocations(&self) -> bool {
+        !self.pending_cleanup.is_empty()
+            || self.clients.values().any(|client| {
+                client
+                    .devices
+                    .values()
+                    .any(|device| device.active && (device.revoked || device.pending_deactivation))
+            })
+    }
+
+    pub fn cleanup_status(&self) -> io::Result<()> {
+        if self.has_pending_revocations() {
+            Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "device revocation remains pending",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn needs_cleanup_retry(&self) -> bool {
+        self.has_pending_revocations() || !self.closing_vts.is_empty()
+    }
+
+    /// Retired opens outlive membership and leases, but can never be granted
+    /// again. Retry every failed ioctl before considering a successor.
+    pub fn retry_cleanup(&mut self) -> Result<Vec<Action>, StateError> {
+        let mut first_error = None;
+        self.pending_cleanup.retain_mut(|device| {
+            match self.device_ops.deactivate(device.kind, &device.fd) {
+                Ok(()) => false,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    true
+                }
+            }
+        });
+        for client in self.clients.values_mut() {
+            for device in client
                 .devices
-                .values()
-                .any(|device| device.revoked && device.active)
-        })
+                .values_mut()
+                .filter(|device| device.active && (device.revoked || device.pending_deactivation))
+            {
+                match self.device_ops.deactivate(device.kind, &device.fd) {
+                    Ok(()) => {
+                        device.active = false;
+                        device.pending_deactivation = false;
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(StateError::Device(error));
+        }
+        if self.vt_release_pending
+            && !self
+                .active
+                .as_ref()
+                .is_some_and(|id| self.clients[id].state == ClientState::PendingDisable)
+        {
+            self.finish_vt_release()?;
+        }
+        self.close_retired_vts();
+        Ok(self.activate_next())
+    }
+
+    fn close_retired_vts(&mut self) {
+        if self.has_pending_revocations() || self.vt_release_pending {
+            return;
+        }
+        if let Some(vt) = self.vt.as_mut() {
+            self.closing_vts.retain(|session| {
+                if let Err(error) = vt.close(*session) {
+                    tracing::warn!(session, %error, "could not restore departing client's VT; retaining retry work");
+                    true
+                } else { false }
+            });
+        }
     }
 
     fn lowest_free_session(&self) -> i32 {
@@ -891,6 +1022,11 @@ impl<D: DeviceOps> Drop for SeatState<D> {
                         "could not deactivate device during actor teardown");
                 }
                 device.active = false;
+            }
+        }
+        for device in &self.pending_cleanup {
+            if let Err(error) = self.device_ops.deactivate(device.kind, &device.fd) {
+                tracing::error!(device = %device.authorization_id, %error, "could not revoke retired device during actor teardown");
             }
         }
         // LinuxVtOps independently restores every owned terminal on drop.
@@ -1338,6 +1474,163 @@ mod tests {
         seat.handle_packet(&client, path_packet("/dev/null"))
             .unwrap();
         assert_eq!(seat.device_ops.opened, 2);
+    }
+
+    #[test]
+    fn teardown_keeps_failed_opens_without_resurrecting_membership() {
+        for kind in [DeviceKind::Drm, DeviceKind::Evdev, DeviceKind::Hidraw] {
+            for operation in ["revoke", "eof", "protocol-close"] {
+                let (mut seat, client) = active_seat();
+                let device = allowed("/dev/null", kind);
+                seat.add_device(device.clone()).unwrap();
+                let opened = seat
+                    .handle_packet(&client, path_packet("/dev/null"))
+                    .unwrap();
+                let held = opened
+                    .into_iter()
+                    .find_map(|action| match action {
+                        Action::Send { fd: Some(fd), .. } => Some(fd),
+                        _ => None,
+                    })
+                    .unwrap();
+                let successor = ClientId::new("successor");
+                seat.add_client(successor.clone()).unwrap();
+                seat.handle_packet(&successor, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+                    .unwrap();
+                seat.device_ops.fail_deactivation = true;
+                let actions = match operation {
+                    "revoke" => seat.revoke_client(&client),
+                    "eof" => seat.handle_eof(&client),
+                    _ => seat.handle_packet(&client, packet(protocol::CLIENT_CLOSE_SEAT, &[])),
+                }
+                .unwrap();
+                assert!(
+                    actions
+                        .iter()
+                        .any(|action| matches!(action, Action::CleanupFailed(_)))
+                );
+                assert_eq!(
+                    seat.client_state(&client),
+                    if operation == "protocol-close" {
+                        Some(ClientState::Connected)
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(seat.client_state(&successor), Some(ClientState::Waiting));
+                assert_eq!(seat.pending_cleanup.len(), 1);
+                assert!(seat.cleanup_status().is_err());
+                assert!(seat.remove_device(&device.id).is_err());
+                assert!(seat.add_device(device.clone()).is_err());
+                assert!(seat.retry_cleanup().is_err());
+                // The caller's duplicate is deliberately still alive.
+                assert!(nix::fcntl::fcntl(&held, nix::fcntl::FcntlArg::F_GETFD).is_ok());
+                seat.device_ops.fail_deactivation = false;
+                // Device-command completion must also resume arbitration.
+                seat.remove_device(&device.id).unwrap();
+                assert!(seat.pending_cleanup.is_empty());
+                assert_eq!(seat.client_state(&successor), Some(ClientState::Active));
+                seat.add_device(device).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn close_device_failure_is_retained_and_other_devices_are_attempted() {
+        let (mut seat, client) = active_seat();
+        seat.replace_devices(vec![
+            allowed("/dev/null", DeviceKind::Evdev),
+            allowed("/dev/zero", DeviceKind::Hidraw),
+        ])
+        .unwrap();
+        for path in ["/dev/null", "/dev/zero"] {
+            seat.handle_packet(&client, path_packet(path)).unwrap();
+        }
+        seat.device_ops.fail_deactivation = true;
+        let actions = seat
+            .handle_packet(
+                &client,
+                packet(protocol::CLIENT_CLOSE_DEVICE, &1i32.to_ne_bytes()),
+            )
+            .unwrap();
+        assert_eq!(sent_opcodes(&actions), [protocol::SERVER_ERROR]);
+        seat.handle_eof(&client).unwrap();
+        assert_eq!(seat.pending_cleanup.len(), 2);
+        assert_eq!(seat.device_ops.deactivated, 2);
+        assert!(seat.retry_cleanup().is_err());
+        assert_eq!(seat.device_ops.deactivated, 4);
+        seat.device_ops.fail_deactivation = false;
+        seat.retry_cleanup().unwrap();
+        assert!(seat.pending_cleanup.is_empty());
+        assert!(seat.client_ids().is_empty());
+    }
+
+    #[test]
+    fn failed_disable_blocks_successor_until_retry_succeeds() {
+        let (mut seat, client) = active_seat();
+        seat.add_device(allowed("/dev/null", DeviceKind::Drm))
+            .unwrap();
+        seat.handle_packet(&client, path_packet("/dev/null"))
+            .unwrap();
+        let successor = ClientId::new("successor");
+        seat.add_client(successor.clone()).unwrap();
+        seat.handle_packet(&successor, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+        seat.device_ops.fail_deactivation = true;
+        seat.handle_packet(
+            &client,
+            packet(protocol::CLIENT_SWITCH_SESSION, &2i32.to_ne_bytes()),
+        )
+        .unwrap();
+        seat.handle_packet(&client, packet(protocol::CLIENT_DISABLE_SEAT, &[]))
+            .unwrap();
+        assert_eq!(seat.client_state(&successor), Some(ClientState::Waiting));
+        assert!(seat.retry_cleanup().is_err());
+        seat.device_ops.fail_deactivation = false;
+        seat.retry_cleanup().unwrap();
+        assert_eq!(seat.client_state(&successor), Some(ClientState::Active));
+    }
+
+    #[test]
+    fn failed_device_revoke_blocks_kernel_release_even_after_ack_timeout_or_eof() {
+        for completion in ["ack", "timeout", "eof"] {
+            let (mut seat, vt) = vt_seat(7);
+            let client = ClientId::new("client");
+            seat.add_client(client.clone()).unwrap();
+            seat.handle_packet(&client, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+                .unwrap();
+            seat.add_device(allowed("/dev/null", DeviceKind::Drm))
+                .unwrap();
+            seat.handle_packet(&client, path_packet("/dev/null"))
+                .unwrap();
+            seat.device_ops.fail_deactivation = true;
+            seat.handle_vt_release().unwrap();
+            match completion {
+                "ack" => {
+                    seat.handle_packet(&client, packet(protocol::CLIENT_DISABLE_SEAT, &[]))
+                        .unwrap();
+                }
+                "timeout" => {
+                    seat.handle_vt_release_timeout().unwrap();
+                }
+                _ => {
+                    seat.handle_eof(&client).unwrap();
+                }
+            }
+            assert!(seat.vt_release_pending());
+            assert_eq!(vt.lock().unwrap().release_acks, 0);
+            assert!(!vt.lock().unwrap().events.contains(&"close:7".to_owned()));
+            assert!(seat.retry_cleanup().is_err());
+            seat.device_ops.fail_deactivation = false;
+            seat.retry_cleanup().unwrap();
+            assert_eq!(vt.lock().unwrap().release_acks, 1);
+            assert!(!seat.vt_release_pending());
+            if completion == "eof" {
+                assert!(vt.lock().unwrap().events.contains(&"close:7".to_owned()));
+            }
+            seat.retry_cleanup().unwrap();
+            assert_eq!(vt.lock().unwrap().release_acks, 1);
+        }
     }
 
     #[test]

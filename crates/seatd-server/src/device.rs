@@ -197,10 +197,55 @@ impl DeviceOps for KernelDeviceOps {
     }
 }
 
+/// Synthetic libseat compatibility fixture, never selected by production.
+/// It accepts ONLY /dev/null as an evdev stand-in; no physical device ioctl is
+/// bypassed. Real driver revocation is tested separately with injected errors
+/// and, during deployment validation, hardware.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct NullDeviceOps;
+
+#[cfg(feature = "test-support")]
+impl DeviceOps for NullDeviceOps {
+    fn open(&mut self, device: &AllowedDevice) -> io::Result<OwnedFd> {
+        if device.path != Path::new("/dev/null") || device.kind != DeviceKind::Evdev {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        KernelDeviceOps::default().open(device)
+    }
+    fn deactivate(&mut self, _: DeviceKind, _: &OwnedFd) -> io::Result<()> {
+        Ok(())
+    }
+    fn activate(&mut self, _: DeviceKind, _: &OwnedFd) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn synthetic_fixture_cannot_bypass_physical_device_revocation() {
+        let mut ops = NullDeviceOps;
+        let null = AllowedDevice::canonicalized(
+            DeviceId::new("null"),
+            "/dev/null",
+            fs::metadata("/dev/null").unwrap().rdev(),
+            DeviceKind::Evdev,
+        )
+        .unwrap();
+        assert!(ops.open(&null).is_ok());
+        let mut other = null.clone();
+        other.path = "/dev/zero".into();
+        assert!(ops.open(&other).is_err());
+        other = null;
+        other.kind = DeviceKind::Drm;
+        assert!(ops.open(&other).is_err());
+    }
 
     #[test]
     fn allowed_device_canonicalizes_identity() {
