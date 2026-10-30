@@ -459,13 +459,22 @@ impl<D: DeviceOps> SeatState<D> {
         client.state = ClientState::Waiting;
         self.members.push_back(id.clone());
 
-        let mut actions = vec![send(id, opened, None)];
+        let mut actions = if self.vt.is_none() {
+            self.retire_active_client()
+        } else {
+            Vec::new()
+        };
+        actions.push(send(id, opened, None));
         actions.push(Action::StateChanged {
             client: id.clone(),
             state: ClientState::Waiting,
         });
         if self.active.is_none() && !self.vt_release_pending && !self.has_pending_revocations() {
             actions.extend(self.activate_client(id));
+        } else if self.vt.is_none() && self.active.is_none() {
+            // Pending device revocation delayed activation. Prefer this client
+            // over the retired predecessor once cleanup is retried.
+            self.next = Some(id.clone());
         }
         Ok(actions)
     }
@@ -723,8 +732,8 @@ impl<D: DeviceOps> SeatState<D> {
         actions
     }
 
-    fn disable_active(&mut self, id: &ClientId) -> Vec<Action> {
-        let client = self.clients.get_mut(id).unwrap();
+    fn deactivate_client_devices(&mut self, id: &ClientId) {
+        let client = self.clients.get_mut(id).expect("client exists");
         for device in client.devices.values_mut() {
             if device.active {
                 match self.device_ops.deactivate(device.kind, &device.fd) {
@@ -736,13 +745,43 @@ impl<D: DeviceOps> SeatState<D> {
                 }
             }
         }
-        client.state = ClientState::PendingDisable;
+    }
+
+    fn disable_active(&mut self, id: &ClientId) -> Vec<Action> {
+        self.deactivate_client_devices(id);
+        self.clients.get_mut(id).expect("client exists").state = ClientState::PendingDisable;
         vec![
             Action::StateChanged {
                 client: id.clone(),
                 state: ClientState::PendingDisable,
             },
             send(id, protocol::empty(protocol::SERVER_DISABLE_SEAT), None),
+        ]
+    }
+
+    /// A non-VT seat has no kernel arbiter that could later enable a queued
+    /// client. Match logind there: a newly joined session becomes the active
+    /// one, and the previous client loses the seat immediately. Its
+    /// acknowledgement is no longer required for the handover.
+    fn retire_active_client(&mut self) -> Vec<Action> {
+        let Some(active) = self.active.take() else {
+            return Vec::new();
+        };
+        self.deactivate_client_devices(&active);
+        self.clients
+            .get_mut(&active)
+            .expect("active client exists")
+            .state = ClientState::Disabled;
+        vec![
+            Action::StateChanged {
+                client: active.clone(),
+                state: ClientState::Disabled,
+            },
+            send(
+                &active,
+                protocol::empty(protocol::SERVER_DISABLE_SEAT),
+                None,
+            ),
         ]
     }
 
@@ -1348,6 +1387,17 @@ mod tests {
         .unwrap()
     }
 
+    /// Builds an already-waiting membership without joining through
+    /// CLIENT_OPEN_SEAT. Joining a non-VT seat now takes it over, so tests
+    /// about explicit switch or queue handling construct their fixture.
+    fn queue_member(seat: &mut SeatState<FakeDeviceOps>, id: &ClientId, session: i32) {
+        seat.add_client(id.clone()).unwrap();
+        let client = seat.clients.get_mut(id).unwrap();
+        client.session = Some(session);
+        client.state = ClientState::Waiting;
+        seat.members.push_back(id.clone());
+    }
+
     fn active_seat() -> (SeatState<FakeDeviceOps>, ClientId) {
         let mut seat = SeatState::new("seat-test", FakeDeviceOps::default());
         let client = ClientId::new("client");
@@ -1494,9 +1544,7 @@ mod tests {
                     })
                     .unwrap();
                 let successor = ClientId::new("successor");
-                seat.add_client(successor.clone()).unwrap();
-                seat.handle_packet(&successor, packet(protocol::CLIENT_OPEN_SEAT, &[]))
-                    .unwrap();
+                queue_member(&mut seat, &successor, 2);
                 seat.device_ops.fail_deactivation = true;
                 let actions = match operation {
                     "revoke" => seat.revoke_client(&client),
@@ -1573,9 +1621,7 @@ mod tests {
         seat.handle_packet(&client, path_packet("/dev/null"))
             .unwrap();
         let successor = ClientId::new("successor");
-        seat.add_client(successor.clone()).unwrap();
-        seat.handle_packet(&successor, packet(protocol::CLIENT_OPEN_SEAT, &[]))
-            .unwrap();
+        queue_member(&mut seat, &successor, 2);
         seat.device_ops.fail_deactivation = true;
         seat.handle_packet(
             &client,
@@ -1657,9 +1703,7 @@ mod tests {
     fn removed_drm_records_are_never_reactivated_after_a_session_switch() {
         let (mut seat, first) = active_seat();
         let second = ClientId::new("second");
-        seat.add_client(second.clone()).unwrap();
-        seat.handle_packet(&second, packet(protocol::CLIENT_OPEN_SEAT, &[]))
-            .unwrap();
+        queue_member(&mut seat, &second, 2);
         let device = allowed("/dev/null", DeviceKind::Drm);
         seat.add_device(device.clone()).unwrap();
         seat.handle_packet(&first, path_packet("/dev/null"))
@@ -1681,15 +1725,71 @@ mod tests {
     }
 
     #[test]
+    fn non_vt_newcomer_takes_the_seat_from_an_active_client() {
+        let mut seat = SeatState::new("seat-test", FakeDeviceOps::default());
+        seat.add_device(allowed("/dev/null", DeviceKind::Drm))
+            .unwrap();
+        let greeter = ClientId::new("greeter");
+        let session = ClientId::new("session");
+        seat.add_client(greeter.clone()).unwrap();
+        seat.handle_packet(&greeter, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+        seat.handle_packet(&greeter, path_packet("/dev/null"))
+            .unwrap();
+        assert_eq!(seat.client_state(&greeter), Some(ClientState::Active));
+
+        seat.add_client(session.clone()).unwrap();
+        let joined = seat
+            .handle_packet(&session, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+
+        // Without a kernel VT arbiter the newcomer cannot open devices while
+        // the previous client stays active, so it must retire it immediately.
+        assert_eq!(seat.client_state(&greeter), Some(ClientState::Disabled));
+        assert_eq!(seat.client_state(&session), Some(ClientState::Active));
+        assert_eq!(seat.device_ops.deactivated, 1);
+        assert!(sent_opcodes(&joined).contains(&protocol::SERVER_DISABLE_SEAT));
+        assert!(sent_opcodes(&joined).contains(&protocol::SERVER_ENABLE_SEAT));
+
+        let opened = seat
+            .handle_packet(&session, path_packet("/dev/null"))
+            .unwrap();
+        assert_eq!(sent_opcodes(&opened), [protocol::SERVER_DEVICE_OPENED]);
+    }
+
+    #[test]
+    fn vt_seat_still_rejects_a_membership_while_another_client_is_active() {
+        let (mut seat, _vt) = vt_seat(7);
+        let greeter = ClientId::new("greeter");
+        let session = ClientId::new("session");
+        seat.add_client(greeter.clone()).unwrap();
+        seat.handle_packet(&greeter, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+        seat.add_client(session.clone()).unwrap();
+        assert!(
+            seat.handle_packet(&session, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+                .is_err()
+        );
+        assert_eq!(seat.client_state(&greeter), Some(ClientState::Active));
+        assert_eq!(seat.client_state(&session), Some(ClientState::Connected));
+    }
+
+    #[test]
     fn switch_waits_for_disable_ack_before_enabling_the_target() {
         let mut seat = SeatState::new("seat-test", FakeDeviceOps::default());
         let first = ClientId::new("first");
         let second = ClientId::new("second");
-        for id in [&first, &second] {
-            seat.add_client(id.clone()).unwrap();
-            seat.handle_packet(id, packet(protocol::CLIENT_OPEN_SEAT, &[]))
-                .unwrap();
-        }
+        seat.add_client(first.clone()).unwrap();
+        seat.handle_packet(&first, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+        // Build an already-queued membership directly: joining a non-VT seat
+        // now retires the active client, and this test is about the explicit
+        // switch handshake afterwards.
+        seat.add_client(second.clone()).unwrap();
+        let queued = seat.clients.get_mut(&second).unwrap();
+        queued.session = Some(2);
+        queued.state = ClientState::Waiting;
+        seat.members.push_back(second.clone());
         let switching = seat
             .handle_packet(
                 &first,
@@ -1887,11 +1987,10 @@ mod tests {
         let mut seat = SeatState::new("seat-test", FakeDeviceOps::default());
         let first = ClientId::new("first");
         let second = ClientId::new("second");
-        for id in [&first, &second] {
-            seat.add_client(id.clone()).unwrap();
-            seat.handle_packet(id, packet(protocol::CLIENT_OPEN_SEAT, &[]))
-                .unwrap();
-        }
+        seat.add_client(first.clone()).unwrap();
+        seat.handle_packet(&first, packet(protocol::CLIENT_OPEN_SEAT, &[]))
+            .unwrap();
+        queue_member(&mut seat, &second, 2);
         seat.next = Some(second);
         let queued = seat.switch_session(&first, 99);
         assert_eq!(sent_opcodes(&queued), [protocol::SERVER_SESSION_SWITCHED]);
