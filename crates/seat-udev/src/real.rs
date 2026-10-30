@@ -294,23 +294,59 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
+    fn environment_device() -> Device {
+        use udev::{AsRaw, FromRawWithContext};
+        unsafe extern "C" {
+            fn udev_device_new_from_environment(context: *mut libc::c_void) -> *mut libc::c_void;
+        }
+        let context = udev::Udev::new().unwrap().into_raw();
+        // SAFETY: context is live; the returned device and context are
+        // transferred together into the matching udev ownership wrapper.
+        let raw = unsafe { udev_device_new_from_environment(context.cast()) };
+        assert!(!raw.is_null());
+        unsafe { Device::from_raw_with_context(context, raw.cast()) }
+    }
+
+    #[test]
+    fn uninitialized_event_is_rejected() {
+        if std::env::var_os("SEAT_UDEV_UNINITIALIZED_FIXTURE").is_some() {
+            let device = environment_device();
+            assert!(!device.is_initialized());
+            assert!(matches!(
+                semantic_device(&device),
+                Err(Error::NotInitialized(path)) if path == device.syspath()
+            ));
+            return;
+        }
+        // No real devnum or database entry: this is independent of whether
+        // the host's /dev/null has been initialized by a running udev daemon.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "real::tests::uninitialized_event_is_rejected"])
+            .env_clear()
+            .env("SEAT_UDEV_UNINITIALIZED_FIXTURE", "1")
+            .env("ACTION", "change")
+            .env(
+                "DEVPATH",
+                "/devices/virtual/seat-udev-uninitialized-fixture",
+            )
+            .env("SUBSYSTEM", "seat-udev-test")
+            .env("SEQNUM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn current_tags_semantic_boundary() {
         // Construct actual libudev event objects from a child-only environment:
         // no global environment mutation, udev injection, or live-node writes.
         if let Ok(mode) = std::env::var("SEAT_UDEV_TAG_FIXTURE") {
-            use udev::{AsRaw, FromRawWithContext};
-            unsafe extern "C" {
-                fn udev_device_new_from_environment(
-                    context: *mut libc::c_void,
-                ) -> *mut libc::c_void;
-            }
-            let context = udev::Udev::new().unwrap().into_raw();
-            // SAFETY: context is live; the returned device and context are
-            // transferred together into the matching udev ownership wrapper.
-            let raw = unsafe { udev_device_new_from_environment(context.cast()) };
-            assert!(!raw.is_null());
-            let device = unsafe { Device::from_raw_with_context(context, raw.cast()) };
+            let device = environment_device();
             if mode == "legacy" {
                 assert!(has_tag_with_api(&device, "uaccess", None));
                 assert!(has_tag_with_api(&device, "master-of-seat", None));
