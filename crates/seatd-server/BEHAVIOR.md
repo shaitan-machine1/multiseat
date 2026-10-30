@@ -49,6 +49,22 @@ The Rust server deliberately permits protocol close/reopen on one socket:
 planned divergence. `tests/root-seatd-server-libseat.sh` covers sequential
 real-libseat use through a deliberately retained duplicate.
 
+## Divergences from upstream seatd
+
+`README.md` records every deliberate difference between this embedded server
+and upstream `seatd`, including transport, authorization, revocation and
+arbitration. One arbitration rule is worth repeating here because it is not a
+C-fork correction:
+
+- A client joining a seat that is not VT-bound retires the active client and
+  becomes active itself, matching logind. Upstream instead queues it until the
+  active client sends `CLIENT_SWITCH_SESSION`, which a display manager cannot
+  do because the successor session number is only assigned when the newcomer
+  opens the seat. VT-bound seats keep kernel arbitration, where a second
+  membership is refused while another client is active.
+  Covered by `state::tests::non_vt_newcomer_takes_the_seat_from_an_active_client`
+  and `state::tests::vt_seat_still_rejects_a_membership_while_another_client_is_active`.
+
 ## Dynamic authorization extensions
 
 Device commands canonicalize their paths and reject ambiguous IDs or paths
